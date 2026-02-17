@@ -17,7 +17,6 @@ boot.bin: boot.o
 
 loader.bin: loader_entry.o loader.o loader_asm.o
 	$(LD) $(LDFLAGS) -T loader_linker.ld -o $@ $^
-	$(CC) $(CFLAGS) -c $< -o $@
 
 loader_entry.o: loader_entry.asm
 	$(AS) $(ASFLAGS) $< -o $@
