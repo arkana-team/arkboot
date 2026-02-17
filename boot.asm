@@ -2,7 +2,6 @@ bits 16
 
 global start
 global bios_print_char
-global bios_read_sector
 extern main
 
 start:
@@ -49,3 +48,4 @@ errmsg db 'E', 0
 
 times 510-($-$$) db 0
 dw 0xAA55
+
