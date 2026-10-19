@@ -31,6 +31,11 @@ def main():
         stream.write(b"start of sparse file")
         stream.seek(2 * 1024 * 1024 - 23)
         stream.write(b"end of sparse file data")
+    config_harness = work / "config_host"
+    run("gcc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Werror",
+        "tests/config_host.c", "config.c", "-o", config_harness)
+    run(config_harness)
     harness = work / "fs_host"
     run("gcc", "-std=c11", "-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=undefined", "-fno-sanitize-recover=all",
         "-Wall", "-Wextra", "-Werror", "tests/fs_host.c", "disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", harness)

@@ -50,3 +50,32 @@ minimal Linux 6.12 kernel. Its SHA-256 was:
 These results establish the documented baseline on QEMU. Physical firmware and
 all optional filesystem features have not been exhaustively tested; see the
 [filesystem limits](../README.md#filesystem-baseline).
+
+## YAML boot menus (2026-10-19)
+
+Built with `make -j2` and validated using the existing Linux 6.12 test kernel
+and static PID 1. `make check` passed configuration parsing with AddressSanitizer
+and UndefinedBehaviorSanitizer, plus the filesystem/partition image checks.
+The configuration harness additionally passed after the final legacy-tab
+compatibility and YAML-tab rejection changes.
+
+`python3 tests/menu.py` passed all eight cases:
+
+| Menu case | Result |
+| --- | --- |
+| Countdown with a nonzero default entry | Selected Rescue and reached PID 1 |
+| Serial W/S selection | Canceled countdown, selected Rescue and reached PID 1 |
+| Serial ANSI arrow selection | Canceled countdown, selected Rescue and reached PID 1 |
+| BIOS keyboard Down/Enter | Canceled countdown, selected Rescue and reached PID 1 |
+| Zero timeout | Booted default entry immediately and reached PID 1 |
+| Indefinite wait | Accepted BIOS keyboard selection and reached PID 1 |
+| Default index outside entry list | Rejected configuration before Linux handoff |
+| Root-level `.yml` on ISO9660 CD | Booted default entry and reached PID 1 |
+
+Disk menu cases used FAT12. Successful cases checked the chosen entry's Linux
+command line and `ARKBOOT_USERSPACE_OK`. Input cases waited beyond the original
+timeout before pressing Enter to check cancellation. Logs are retained in
+`build/menu-tests/`. The complete ten-case legacy `.cfg` matrix also passed via
+`tests/boot.py`, covering all filesystems and both disk partition tables listed
+above. Each guest ran sequentially with 128 MiB RAM and a host memory preflight.
+Physical hardware remains untested.

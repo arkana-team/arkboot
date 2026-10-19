@@ -1,0 +1,12 @@
+# Entry indexes start at zero. Any key cancels the countdown.
+default: 0
+timeout: 5
+entries:
+  - title: Linux
+    kernel: /boot/vmlinuz
+    initrd: /boot/initrd.img
+    cmdline: console=tty0 root=UUID=YOUR-ROOT-FILESYSTEM-UUID ro
+  - title: Linux rescue
+    kernel: /boot/vmlinuz
+    initrd: /boot/initrd.img
+    cmdline: console=tty0 root=UUID=YOUR-ROOT-FILESYSTEM-UUID ro single

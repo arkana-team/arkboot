@@ -147,8 +147,9 @@ def main():
     for path in args.root.rglob("*"):
         if path.is_symlink() or not (path.is_dir() or path.is_file()):
             raise ValueError(f"Only regular files/directories are supported in boot trees: {path}")
-    if not ((args.root / "boot/arkboot.cfg").is_file() or (args.root / "arkboot.cfg").is_file()):
-        raise ValueError("Boot tree must contain boot/arkboot.cfg or arkboot.cfg")
+    if not any((args.root / directory / f"arkboot.{ext}").is_file()
+               for directory in ("boot", "") for ext in ("yaml", "yml", "cfg")):
+        raise ValueError("Boot tree must contain arkboot.yaml, arkboot.yml or arkboot.cfg in boot/ or root")
     for binary in ("boot.bin", "cdboot.bin", "loader.bin"):
         if not (REPO / binary).is_file():
             raise ValueError("Run make before generating images")

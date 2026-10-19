@@ -1,4 +1,4 @@
-#include "fs.h"
+#include "config.h"
 
 #define PARAM_SIZE 4096
 #define E820_MAX 128
@@ -6,13 +6,9 @@ struct e820_entry { u64 address, size; u32 type; } __attribute__((packed));
 static u8 params[PARAM_SIZE] __attribute__((aligned(16)));
 static struct e820_entry memory[E820_MAX];
 static u32 memory_count;
-static char config_text[4096];
-static struct {
-    char kernel[FS_PATH_MAX + 1];
-    char initrd[FS_PATH_MAX + 1];
-    char cmdline[2048];
-    bool initrd_explicit;
-} config;
+static char config_text[BOOT_CONFIG_MAX];
+static struct boot_config boot_config;
+static struct boot_entry config;
 
 static void memory_map(void) {
     struct bios_regs low = {0};
@@ -64,43 +60,16 @@ static void check_a20(void) {
     *high = saved_high; *low = saved_low;
     if (!enabled) panic("could not enable A20");
 }
-static char *trim(char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
-    size_t n = strlen(s);
-    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r')) s[--n] = 0;
-    return s;
-}
-static void config_value(char *out, u32 capacity, const char *value) {
-    if (strlen(value) >= capacity) panic("configuration value too long");
-    memcpy(out, value, strlen(value) + 1);
-}
-static void read_config(struct volume *v, const struct node *file) {
-    config_value(config.kernel, sizeof config.kernel, "/boot/vmlinuz");
-    config_value(config.initrd, sizeof config.initrd, "/boot/initrd.img");
-    config_value(config.cmdline, sizeof config.cmdline, "console=tty0");
+static void read_config(struct volume *v, const struct node *file, bool yaml) {
     if (file->size >= sizeof config_text || !fs_read(v, file, 0, config_text, file->size))
-        panic("cannot read arkboot.cfg (maximum 4095 bytes)");
+        panic("cannot read boot configuration (maximum 16383 bytes)");
+    for (u32 i = 0; i < file->size; i++)
+        if (!config_text[i]) panic("NUL byte in boot configuration");
     config_text[file->size] = 0;
-    for (char *line = config_text; *line;) {
-        char *next = line;
-        while (*next && *next != '\n') next++;
-        if (*next) *next++ = 0;
-        char *key = trim(line);
-        if (*key && *key != '#') {
-            char *value = key;
-            while (*value && *value != '=') value++;
-            if (!*value) panic("configuration requires key=value");
-            *value++ = 0; key = trim(key); value = trim(value);
-            if (!strcmp(key, "kernel")) config_value(config.kernel, sizeof config.kernel, value);
-            else if (!strcmp(key, "initrd")) {
-                config_value(config.initrd, sizeof config.initrd, value);
-                config.initrd_explicit = true;
-            } else if (!strcmp(key, "cmdline")) config_value(config.cmdline, sizeof config.cmdline, value);
-            else panic("unknown configuration key");
-        }
-        line = next;
-    }
-    if (!config.kernel[0]) panic("kernel path is empty");
+    u32 line;
+    const char *err = config_parse(&boot_config, config_text, yaml, &line);
+    if (err) { print("Configuration error near line "); print_hex(line); print("\n"); panic(err); }
+    config = boot_config.entries[menu_select(&boot_config)];
 }
 static u32 kernel_address(const u8 *h, u32 size) {
     u64 preferred = rd64(h + 0x258);
@@ -203,11 +172,21 @@ void boot_main(u32 drive, u32 block_size) {
             continue;
         }
         print("Found "); print(fs_name(&v)); print("\n");
-        if (!fs_open(&v, "/boot/arkboot.cfg", &cfg) && !fs_open(&v, "/arkboot.cfg", &cfg)) {
-            print("No arkboot.cfg on this volume\n"); continue;
+        static const char *const paths[] = {
+            "/boot/arkboot.yaml", "/boot/arkboot.yml", "/arkboot.yaml", "/arkboot.yml",
+            "/boot/arkboot.cfg", "/arkboot.cfg"
+        };
+        u32 path;
+        for (path = 0; path < sizeof paths / sizeof paths[0]; path++) {
+            if (fs_open(&v, paths[path], &cfg)) break;
+            if (!fs_error || strcmp(fs_error, "file not found")) panic(fs_error);
         }
-        if (cfg.directory) panic("arkboot.cfg is a directory");
-        read_config(&v, &cfg);
+        if (path == sizeof paths / sizeof paths[0]) {
+            print("No boot configuration on this volume\n"); continue;
+        }
+        print("Configuration: "); print(paths[path]); print("\n");
+        if (cfg.directory) panic("boot configuration is a directory");
+        read_config(&v, &cfg, path < 4);
         boot_linux(&v);
     }
     panic("no boot configuration found on boot drive");

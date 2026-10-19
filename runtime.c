@@ -81,3 +81,39 @@ _Noreturn void panic(const char *s) {
     print("ARKBOOT: "); print(s ? s : "unspecified boot failure"); print("\n");
     for (;;) __asm__ volatile("cli; hlt");
 }
+
+void console_clear(void) {
+    /* ANSI clear/home for serial terminals, direct text buffer for VGA. */
+    print("\033[2J\033[H");
+    volatile u16 *vga = (volatile u16 *)0xb8000;
+    for (u32 i = 0; i < 80 * 25; i++) vga[i] = 0x0720;
+    cursor = 0;
+}
+int console_key(void) {
+    static u32 escape;
+    if (inb(0x3fd) & 1) {
+        u8 c = inb(0x3f8);
+        if (c == 27) { escape = 1; return 27; }
+        if (escape == 1 && (c == '[' || c == 'O')) { escape = 2; return -1; }
+        if (escape == 2) {
+            escape = 0;
+            if (c == 'A') return 0x4800;
+            if (c == 'B') return 0x5000;
+            if (c == 'H') return 0x4700;
+            if (c == 'F') return 0x4f00;
+        }
+        escape = 0;
+        return c;
+    }
+    struct bios_regs r = { .eax = 0x100 };
+    bios_call(0x16, &r);
+    if (r.flags & 0x40) return -1;
+    r.eax = 0;
+    bios_call(0x16, &r);
+    return (r.eax & 0xff) ? r.eax & 0xff : r.eax & 0xff00;
+}
+u32 console_ticks(void) {
+    struct bios_regs r = {0};
+    bios_call(0x1a, &r);
+    return ((r.ecx & 0xffff) << 16) | (r.edx & 0xffff);
+}

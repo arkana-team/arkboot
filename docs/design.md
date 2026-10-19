@@ -12,7 +12,11 @@
    into the bridge's `int` instruction, so that small section is intentionally
    writable and executable.
 3. The core checks A20, collects E820, discovers the boot drive's partitions,
-   probes filesystems and reads `arkboot.cfg`.
+   probes filesystems and reads `arkboot.yaml`/`arkboot.yml` (or legacy
+   `arkboot.cfg`). A bounded parser builds up to 16 boot entries. The text menu
+   polls BIOS INT 16h and COM1 input; INT 1Ah ticks drive the optional countdown,
+   including midnight wrap. Any key disables automatic boot. The selected
+   entry supplies the kernel, initramfs and command line to the Linux loader.
 4. The Linux loader validates the bzImage setup header, selects usable RAM,
    reads the protected-mode payload and optional initramfs, prepares a zeroed
    `boot_params`, then changes to Linux's required GDT selectors and jumps to

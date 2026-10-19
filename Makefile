@@ -8,7 +8,7 @@ CFLAGS = -std=c11 -m32 -march=i386 -Os -ffreestanding -fno-builtin -fno-pie \
          -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
          -mno-sse -mno-mmx -msoft-float -Wall -Wextra -Werror -MMD -MP
 LDFLAGS = -m elf_i386 -nostdlib -T loader_linker.ld
-SOURCES = loader.c runtime.c disk.c fs/fs.c fs/fat.c fs/ext.c fs/iso9660.c fs/udf.c
+SOURCES = loader.c config.c menu.c runtime.c disk.c fs/fs.c fs/fat.c fs/ext.c fs/iso9660.c fs/udf.c
 OBJECTS = $(SOURCES:%.c=build/%.o) build/loader_entry.o
 
 all: boot.bin cdboot.bin loader.bin
@@ -33,7 +33,7 @@ boot.bin: boot.asm loader.bin
 cdboot.bin: boot.asm loader.bin
 	$(AS) -f bin -D CD_BOOT=1 -D BLOCK_SIZE=2048 -D CORE_BLOCKS=$$((($$(stat -c %s loader.bin)+2047)/2048)) $< -o $@
 
-# ROOT is a directory containing boot/arkboot.cfg, kernel and optional initramfs.
+# ROOT is a directory containing boot/arkboot.yaml (or .cfg), kernel and optional initramfs.
 # Images are generated files only; no target writes to physical devices.
 FS ?= fat32
 ROOT ?= root
