@@ -1,4 +1,5 @@
 #include "config.h"
+#include "bios.h"
 
 #define PARAM_SIZE 4096
 #define E820_MAX 128
@@ -6,8 +7,6 @@ struct e820_entry { u64 address, size; u32 type; } __attribute__((packed));
 static u8 params[PARAM_SIZE] __attribute__((aligned(16)));
 static struct e820_entry memory[E820_MAX];
 static u32 memory_count;
-static char config_text[BOOT_CONFIG_MAX];
-static struct boot_config boot_config;
 static struct boot_entry config;
 
 static void memory_map(void) {
@@ -59,17 +58,6 @@ static void check_a20(void) {
     bool enabled = *low != *high;
     *high = saved_high; *low = saved_low;
     if (!enabled) panic("could not enable A20");
-}
-static void read_config(struct volume *v, const struct node *file, bool yaml) {
-    if (file->size >= sizeof config_text || !fs_read(v, file, 0, config_text, file->size))
-        panic("cannot read boot configuration (maximum 16383 bytes)");
-    for (u32 i = 0; i < file->size; i++)
-        if (!config_text[i]) panic("NUL byte in boot configuration");
-    config_text[file->size] = 0;
-    u32 line;
-    const char *err = config_parse(&boot_config, config_text, yaml, &line);
-    if (err) { print("Configuration error near line "); print_hex(line); print("\n"); panic(err); }
-    config = boot_config.entries[menu_select(&boot_config)];
 }
 static u32 kernel_address(const u8 *h, u32 size) {
     u64 preferred = rd64(h + 0x258);
@@ -166,27 +154,13 @@ void boot_main(u32 drive, u32 block_size) {
     u32 count = partitions(&disk, candidates, 32);
     if (!count) panic(fs_error ? fs_error : "invalid partition table");
     for (u32 i = 0; i < count; i++) {
-        struct volume v; struct node cfg;
+        struct volume v;
         if (!fs_mount(&v, &candidates[i])) {
             if (fs_error) { print("Skipping volume: "); print(fs_error); print("\n"); }
             continue;
         }
         print("Found "); print(fs_name(&v)); print("\n");
-        static const char *const paths[] = {
-            "/boot/arkboot.yaml", "/boot/arkboot.yml", "/arkboot.yaml", "/arkboot.yml",
-            "/boot/arkboot.cfg", "/arkboot.cfg"
-        };
-        u32 path;
-        for (path = 0; path < sizeof paths / sizeof paths[0]; path++) {
-            if (fs_open(&v, paths[path], &cfg)) break;
-            if (!fs_error || strcmp(fs_error, "file not found")) panic(fs_error);
-        }
-        if (path == sizeof paths / sizeof paths[0]) {
-            print("No boot configuration on this volume\n"); continue;
-        }
-        print("Configuration: "); print(paths[path]); print("\n");
-        if (cfg.directory) panic("boot configuration is a directory");
-        read_config(&v, &cfg, path < 4);
+        if (!config_load(&v, &config)) continue;
         boot_linux(&v);
     }
     panic("no boot configuration found on boot drive");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build BIOS disk/CD images as regular files; never install to a device."""
+"""Build BIOS and optional x86-64 UEFI images; never install to a device."""
 import argparse
 import os
 import pathlib
@@ -43,16 +43,31 @@ def partition(args, output, length):
         run(tool(f"mkfs.{args.fs}"), "-q", "-F", "-d", args.root, output)
 
 
-def gpt(stream, blocks, fs):
-    """Reserve sectors 34..2047 for the core; data starts at the 1 MiB mark."""
+def efi_partition(output, optical=False):
+    # FAT32 ESP for disks; a small removable FAT16 image for El Torito CDs.
+    with output.open("wb") as stream:
+        stream.truncate((8 if optical else 64) * 1024 * 1024)
+    run(tool("mkfs.fat"), "-F", "16" if optical else "32",
+        *(["-s", "1"] if optical else []), output)
+    run(tool("mmd"), "-i", output, "::/EFI", "::/EFI/BOOT")
+    run(tool("mcopy"), "-i", output, REPO / "BOOTX64.EFI", "::/EFI/BOOT/BOOTX64.EFI")
+
+
+def gpt(stream, blocks, fs, uefi=False):
+    """Reserve a BIOS core area, optional ESP, and the selected data filesystem."""
     entries = bytearray(128 * 128)
     bios_type = uuid.UUID("21686148-6449-6e6f-744e-656564454649")
     data_type = uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" if fs.startswith("fat")
                           else "0fc63daf-8483-4772-8e79-3d69d8477de4")
     last = blocks - 34
-    for index, kind, first, end, name in (
-            (0, bios_type, 34, 2047, "Arkboot core"),
-            (1, data_type, 2048, last, "Arkboot files")):
+    layout = [(bios_type, 34, 2047, "Arkboot core")]
+    data_start = 2048
+    if uefi:
+        data_start += 64 * 2048
+        layout.append((uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b"),
+                       2048, data_start - 1, "EFI System Partition"))
+    layout.append((data_type, data_start, last, "Arkboot files"))
+    for index, (kind, first, end, name) in enumerate(layout):
         struct.pack_into("<16s16sQQQ72s", entries, index * 128,
                          kind.bytes_le, uuid.uuid4().bytes_le, first, end, 0,
                          name.encode("utf-16le"))
@@ -74,7 +89,10 @@ def disk(args):
     if args.size_mib < 4:
         raise ValueError("Disk image must be at least 4 MiB")
     is_gpt = args.partition_table == "gpt"
-    count = blocks - 2048 - (33 if is_gpt else 0)
+    data_start = 2048 + (64 * 2048 if args.uefi else 0)
+    count = blocks - data_start - (33 if is_gpt else 0)
+    if args.uefi and args.size_mib < 68:
+        raise ValueError("UEFI disk images must be at least 68 MiB, including the 64 MiB ESP")
     core_lba = 34 if is_gpt else 1
     core = (REPO / "loader.bin").read_bytes()
     if core_lba * 512 + len(core) > 1024 * 1024:
@@ -84,19 +102,29 @@ def disk(args):
     kind = {"fat12": 1, "fat16": 0x0e, "fat32": 0x0c}.get(args.fs, 0x83)
     struct.pack_into("<B3sB3sII", boot, 446, 0 if is_gpt else 0x80, b"\xfe\xff\xff",
                      0xee if is_gpt else kind, b"\xfe\xff\xff",
-                     1 if is_gpt else 2048, min(blocks - 1, 0xffffffff) if is_gpt else count)
+                     1 if is_gpt else data_start, min(blocks - 1, 0xffffffff) if is_gpt else count)
+    if args.uefi and not is_gpt:
+        struct.pack_into("<B3sB3sII", boot, 462, 0, b"\xfe\xff\xff", 0xef,
+                         b"\xfe\xff\xff", 2048, 64 * 2048)
     with tempfile.TemporaryDirectory(prefix="arkboot-", dir=args.output.parent) as tmp:
         part = pathlib.Path(tmp) / "partition.img"
         image = pathlib.Path(tmp) / "disk.img"
         partition(args, part, count * 512)
+        esp = pathlib.Path(tmp) / "esp.img"
+        if args.uefi:
+            efi_partition(esp)
         with image.open("w+b") as stream:
             stream.truncate(blocks * 512)
             stream.write(boot)
             if is_gpt:
-                gpt(stream, blocks, args.fs)
+                gpt(stream, blocks, args.fs, args.uefi)
             stream.seek(core_lba * 512)
             stream.write(core)
-            stream.seek(1024 * 1024)
+            if args.uefi:
+                stream.seek(1024 * 1024)
+                with esp.open("rb") as source:
+                    shutil.copyfileobj(source, stream, 1024 * 1024)
+            stream.seek(data_start * 512)
             with part.open("rb") as source:
                 shutil.copyfileobj(source, stream, 1024 * 1024)
         os.replace(image, args.output)
@@ -116,9 +144,15 @@ def iso(args):
             command = [tool(args.mkisofs), "-udf"]
         else:
             command = [tool("xorriso"), "-as", "mkisofs"]
+        if args.uefi:
+            efi_partition(tree / "boot/arkboot-efi.img", optical=True)
+        # Explicit platform + -b works with both cdrtools and xorriso.
+        efi_options = (["-eltorito-alt-boot", "-eltorito-platform", "efi",
+                        "-b", "boot/arkboot-efi.img", "-no-emul-boot"]
+                       if args.uefi else [])
         run(*command, "-iso-level", "3", "-R", "-J", "-b", "boot/arkboot-cd.bin",
             "-c", "boot/boot.cat", "-no-emul-boot", "-boot-load-size", "4",
-            "-boot-info-table", "-o", generated, tree)
+            "-boot-info-table", *efi_options, "-o", generated, tree)
         os.replace(generated, args.output)
 
 
@@ -129,6 +163,7 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--root", required=True, type=pathlib.Path)
         p.add_argument("--output", required=True, type=pathlib.Path)
+        p.add_argument("--uefi", action="store_true", help="Add x86-64 UEFI boot alongside BIOS")
         if name == "disk":
             p.add_argument("--fs", choices=FILESYSTEMS, default="fat32")
             p.add_argument("--size-mib", type=int, default=128)
@@ -150,7 +185,7 @@ def main():
     if not any((args.root / directory / f"arkboot.{ext}").is_file()
                for directory in ("boot", "") for ext in ("yaml", "yml", "cfg")):
         raise ValueError("Boot tree must contain arkboot.yaml, arkboot.yml or arkboot.cfg in boot/ or root")
-    for binary in ("boot.bin", "cdboot.bin", "loader.bin"):
+    for binary in ("boot.bin", "cdboot.bin", "loader.bin") + (("BOOTX64.EFI",) if args.uefi else ()):
         if not (REPO / binary).is_file():
             raise ValueError("Run make before generating images")
     (disk if args.kind == "disk" else iso)(args)

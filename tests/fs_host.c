@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "../fs.h"
+#include "../bios.h"
 
 /* Emulate only BIOS disk I/O. Partition and filesystem code is the actual core
    implementation, exercised with normal image-tool output and bounded memory. */

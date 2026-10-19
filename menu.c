@@ -22,8 +22,8 @@ static void draw(const struct boot_config *c, u32 selected, int remaining) {
 u32 menu_select(const struct boot_config *c) {
     u32 selected = c->default_entry;
     if (!c->timeout) return selected;
-    u32 last = console_ticks(), elapsed = 0;
-    u32 duration = c->timeout > 0 ? ((u32)c->timeout * 182 + 9) / 10 : 0;
+    u32 last = console_millis(), elapsed = 0;
+    u32 duration = c->timeout > 0 ? (u32)c->timeout * 1000 : 0;
     int remaining = c->timeout;
     draw(c, selected, remaining);
     for (;;) {
@@ -40,12 +40,11 @@ u32 menu_select(const struct boot_config *c) {
             draw(c, selected, remaining);
         }
         if (duration) {
-            u32 now = console_ticks();
-            /* BIOS ticks wrap at midnight (0x1800b0 ticks/day). */
-            elapsed += now >= last ? now - last : 0x1800b0 - last + now;
+            u32 now = console_millis();
+            elapsed += now - last;
             last = now;
             if (elapsed >= duration) break;
-            int seconds = ((duration - elapsed) * 10 + 181) / 182;
+            int seconds = (duration - elapsed + 999) / 1000;
             if (seconds != remaining) { remaining = seconds; draw(c, selected, remaining); }
         }
     }

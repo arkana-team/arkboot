@@ -67,11 +67,13 @@ def main():
     parser.add_argument("--root", type=pathlib.Path, default=REPO / "build/validation/root")
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--case", help="Run just one named case, e.g. ext4-gpt or udf")
+    parser.add_argument("--dual-firmware", action="store_true",
+                        help="Generate images with --uefi and boot them through BIOS")
     parser.add_argument("--mkisofs", default=os.environ.get("MKISOFS", "mkisofs"))
     args = parser.parse_args()
     os.chdir(REPO)
     root = args.root.resolve(strict=True)
-    work = REPO / "build/boot-tests"
+    work = REPO / ("build/boot-tests-dual" if args.dual_firmware else "build/boot-tests")
     work.mkdir(parents=True, exist_ok=True)
     cases = [(f"{fs}-mbr", fs, size, "mbr") for fs, size in
              (("fat12", 8), ("fat16", 32), ("fat32", 96), ("ext2", 32), ("ext3", 32), ("ext4", 32))]
@@ -87,6 +89,9 @@ def main():
         image = work / f"{name}.{'iso' if not table else 'img'}"
         command = [sys.executable, "scripts/mkimage.py", "disk" if table else "iso",
                    "--root", str(root), "--output", str(image)]
+        if args.dual_firmware:
+            command += ["--uefi"]
+            size += 64
         if table:
             command += ["--fs", fs, "--size-mib", str(size), "--partition-table", table]
         elif fs == "udf":

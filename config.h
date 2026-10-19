@@ -18,5 +18,6 @@ struct boot_config {
 };
 /* Parses in place. Returns an error string, or NULL on success. */
 const char *config_parse(struct boot_config *config, char *text, bool yaml, u32 *line);
+bool config_load(struct volume *v, struct boot_entry *selected);
 u32 menu_select(const struct boot_config *config);
 #endif

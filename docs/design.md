@@ -1,6 +1,6 @@
-# BIOS Linux baseline
+# BIOS and x86-64 UEFI design
 
-## Boot path
+## BIOS boot path
 
 1. The disk bootstrap reads the core from an embedded LBA recorded at byte 8.
    CD tooling instead patches the El Torito boot-information table at bytes
@@ -22,7 +22,35 @@
    `boot_params`, then changes to Linux's required GDT selectors and jumps to
    the kernel's 32-bit entry with ESI pointing to the parameters.
 
-## Memory ownership
+## UEFI boot path
+
+1. Firmware loads `/EFI/BOOT/BOOTX64.EFI` from the FAT EFI partition (or the
+   additional EFI El Torito image). GNU-EFI startup relocates the x86-64 PE/COFF
+   application. Firmware calls and callbacks use the Microsoft x64 ABI; the
+   shared C core uses the normal compiler ABI.
+2. The UEFI frontend uses the loaded image's device path to find its physical
+   parent Block I/O device. It does not enumerate other drives for configuration.
+   Aligned, bounded bounce-buffer reads feed the shared MBR/GPT and filesystem
+   readers. UEFI console protocols provide text output and keyboard input; a
+   firmware timer provides milliseconds for the shared menu countdown.
+3. Both frontends call `config_load` and `menu_select`, with identical config
+   discovery order, parsing and entry selection. The menu uses a platform
+   millisecond clock; the BIOS backend handles its midnight tick wrap.
+4. The UEFI Linux frontend validates an AMD64 PE32+ kernel, loads it through
+   `LoadImage`, assigns UTF-16 `LoadOptions` and registers an initramfs provider
+   with `EFI_LOAD_FILE2` and `LINUX_EFI_INITRD_MEDIA_GUID`. This supports initramfs
+   files on all Arkboot filesystems without requiring firmware filesystem drivers.
+5. It closes the menu timer and calls `StartImage`. Linux's EFI stub owns the
+   final memory map, EFI/ACPI/framebuffer discovery and `ExitBootServices`.
+   Arkboot does not reuse BIOS boot parameters or its 32-bit entry trampoline.
+
+The UEFI build uses GNU-EFI's headers, startup and relocation library. It does
+not link GNU-EFI's utility library or libc. IA32 firmware and the deprecated
+Linux EFI handover protocol are unsupported.
+UEFI allocations remain owned by the firmware memory map until the kernel stub
+exits boot services; there are no fixed low-memory scratch addresses.
+
+## BIOS memory ownership
 
 | Physical range | Use |
 | --- | --- |
@@ -43,6 +71,13 @@ kernel handoff. Filesystem metadata checks protect bounds but are not intended
 as a complete hostile-media security boundary.
 
 ## References
+
+* [UEFI Boot Services](https://uefi.org/specs/UEFI/2.11/07_Services_Boot_Services.html)
+  — image loading, memory allocation, timer events and protocol installation.
+* [UEFI media access](https://uefi.org/specs/UEFI/2.11/13_Protocols_Media_Access.html)
+  — Block I/O, Load File 2, FAT system partitions and firmware boot media.
+* [Linux EFI PE/COFF entry](https://docs.kernel.org/arch/x86/boot.html#pe-coff-entry-point)
+  — standard EFI kernel entry and initramfs provider protocol.
 
 * [Linux/x86 boot protocol](https://www.kernel.org/doc/html/latest/arch/x86/boot.html)
   — setup fields, placement, initramfs limit and 32-bit entry requirements.

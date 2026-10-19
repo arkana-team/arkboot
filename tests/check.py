@@ -38,7 +38,7 @@ def main():
     run(config_harness)
     harness = work / "fs_host"
     run("gcc", "-std=c11", "-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=undefined", "-fno-sanitize-recover=all",
-        "-Wall", "-Wextra", "-Werror", "tests/fs_host.c", "disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", harness)
+        "-Wall", "-Wextra", "-Werror", "tests/fs_host.c", "disk.c", "bios_disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", harness)
     cases = [(fs, size, "mbr") for fs, size in
              (("fat12", 8), ("fat16", 32), ("fat32", 96), ("ext2", 32), ("ext3", 32), ("ext4", 32))]
     cases += [("fat32", 96, "gpt"), ("ext4", 32, "gpt")]

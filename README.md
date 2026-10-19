@@ -1,21 +1,27 @@
 # Arkboot
 
-A BIOS Linux bootloader with a small disk/CD bootstrap and a freestanding
-32-bit C core. It reads a configuration file, loads an x86 Linux `bzImage` and
-optional initramfs, and enters Linux through its 32-bit boot protocol. Suitable
-64-bit kernels use that entry point too; Arkboot does not enter long mode.
+A Linux bootloader for BIOS and **x86-64 UEFI**, with shared YAML boot menus,
+partition parsing and read-only filesystem drivers. The BIOS frontend uses a
+32-bit freestanding C core and Linux's 32-bit boot protocol. The UEFI frontend
+is a 64-bit EFI application and launches Linux through its EFI stub.
 
 ## Build
 
-Required: GCC with i386 code generation, NASM, GNU binutils, Make and Python 3.
-No libc or 32-bit userspace libraries are needed for the loader.
+Required: GCC with i386/x86-64 code generation, NASM, GNU binutils, Make,
+Python 3 and **GNU-EFI** headers/startup/relocation library (for example the
+`gnu-efi` package). No libc or 32-bit userspace libraries are needed.
+`EFI_INCLUDE` and `EFI_LIB` can override `/usr/include/efi` and `/usr/lib` when
+GNU-EFI is installed elsewhere.
 
 ```sh
 make -j2
 ```
 
-This produces `boot.bin`, `cdboot.bin`, `loader.bin`, and the inspectable
-`build/loader.elf` / `build/loader.map`. The core is loaded at physical `0x8000`;
+This builds both firmware paths: `BOOTX64.EFI`, `boot.bin`, `cdboot.bin` and
+`loader.bin`. Use `make uefi` or `make bios` to build just one frontend; the BIOS
+build does not need GNU-EFI. Inspectable UEFI output is in
+`build/uefi/arkboot.so` / `build/uefi/arkboot.map`; BIOS output is in
+`build/loader.elf` / `build/loader.map`. The BIOS core is loaded at physical `0x8000`;
 its assembly BIOS bridge stays below 64 KiB. Code and BSS, the BIOS transfer
 buffer, real-mode stack and protected-mode stack occupy separate memory areas.
 
@@ -48,8 +54,10 @@ entries:
 ```
 
 Select with **Up/Down** (or **W/S**) and press **Enter** to boot. Home/End select
-the first/last entry. The menu appears on VGA and COM1 at 115200 baud; serial
-terminals support W/S, Enter and ANSI arrow keys. Any key cancels the countdown.
+the first/last entry. BIOS uses VGA and COM1 at 115200 baud; UEFI uses the
+firmware's text console and keyboard, including serial when configured by the
+firmware. BIOS serial terminals support W/S, Enter and ANSI arrow keys.
+Any key cancels the countdown.
 `default` is a zero-based entry index (default `0`). `timeout` defaults to five
 seconds; `0` boots immediately and `-1` waits indefinitely. Positive timeouts
 are limited to 3600 seconds.
@@ -59,7 +67,8 @@ Arkboot searches each volume for `/boot/arkboot.yaml`, `/boot/arkboot.yml`,
 order. It boots from the first volume containing a configuration. Invalid
 configuration stops boot with an error instead of falling back to another file.
 The kernel, initramfs and config must be on the same filesystem on the BIOS boot
-drive. Arkboot does not search other drives or discover Linux installations
+drive (the physical parent of the loaded EFI partition/CD under UEFI).
+Arkboot does not search other drives or discover Linux installations
 automatically. Linux/initramfs provide the root filesystem drivers.
 
 YAML uses a bounded block format: `entries` is a sequence with **two spaces**
@@ -131,6 +140,49 @@ qemu-system-x86_64 -m 128 -cdrom arkboot.iso -boot order=d -serial stdio
 `--mkisofs /path/to/mkisofs` can select a non-system cdrtools binary. UDF bridge
 images are mounted through the UDF driver, rather than their ISO9660 fallback tree.
 
+## x86-64 UEFI images
+
+UEFI requires an **x86-64 Linux kernel built with `CONFIG_EFI_STUB=y`**.
+Initramfs loading also requires support for Linux's Load File 2 provider protocol;
+this path is validated with Linux 6.12. The same kernel can also boot through BIOS. Arkboot loads it with UEFI image services,
+passes the entry's command line as UTF-16 load options and supplies its initramfs
+through Linux's `EFI_LOAD_FILE2` protocol. The kernel's EFI stub performs the
+final memory-map and `ExitBootServices` handoff. IA32 UEFI is unsupported.
+
+Add `--uefi` to generate an image that boots through either BIOS or UEFI:
+
+```sh
+python3 scripts/mkimage.py disk --root root --fs ext4 --partition-table gpt --uefi --output disk.img
+python3 scripts/mkimage.py iso --root root --uefi --output arkboot.iso
+python3 scripts/mkimage.py iso --root root --udf --uefi --output udf.iso
+```
+
+Disk images gain a **64 MiB FAT32 EFI System Partition** containing
+`/EFI/BOOT/BOOTX64.EFI`; the chosen data filesystem holds the config, kernel and
+initramfs. `--size-mib` includes the ESP: allow at least 68 MiB total, plus enough
+space for boot files and filesystem metadata. GPT retains its BIOS boot
+partition; MBR images use a type-`0xef` ESP. CD images include an additional EFI
+El Torito entry backed by an 8 MiB FAT16 image. The EFI partition contains only
+Arkboot, so filesystem support is provided by the same drivers as BIOS.
+
+For example, with OVMF installed (adjust paths for your distribution):
+
+```sh
+cp /usr/share/edk2/x64/OVMF_VARS.4m.fd build/OVMF_VARS.fd
+qemu-system-x86_64 -machine q35 -m 256 \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+  -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
+  -drive format=raw,file=disk.img -serial stdio
+```
+
+`make disk.img UEFI=1` and `make arkboot.iso UEFI=1` are convenience targets.
+
+`BOOTX64.EFI` can also be copied to an existing ESP at `/EFI/BOOT/BOOTX64.EFI`.
+Arkboot searches the filesystems on that same physical drive for configuration.
+UEFI uses firmware Block I/O and allocated memory; it does not invoke BIOS
+interrupts or use the BIOS core's fixed physical addresses. Builds are unsigned;
+Secure Boot trust and signing are not implemented.
+
 ## Filesystem baseline
 
 All drivers are read-only. Unsupported features cause an error, and files must be
@@ -144,16 +196,16 @@ regular files reached through directories; symlinks are not followed.
 | UDF | One physical type-1 partition map; FE/EFE; short/long/embedded allocation, continuation extents, holes; CS0 8/16-bit names | No VAT, sparable/metadata maps, indirect ICBs, symlinks or surrogate pairs; anchor at block 256 |
 
 On disk, MBR primary/logical partitions and GPT are supported. GPT header and
-entry-array CRCs are checked. BIOS extended disk services (EDD) and E820 are
+entry-array CRCs are checked. For BIOS, extended disk services (EDD) and E820 are
 required; there is no CHS fallback or native SATA/NVMe/USB driver. When BIOS omits optical capacity, an ISO primary volume descriptor is required
 (including on UDF bridge CDs). Initial disk
 boot currently assumes 512-byte BIOS blocks, and CD boot 2048-byte blocks.
 
-The Linux loader requires boot protocol 2.10 or newer, loads below 4 GiB, checks
+The BIOS Linux loader requires boot protocol 2.10 or newer, loads below 4 GiB, checks
 RAM availability/alignment and initialization size, reserves the kernel's whole
 initialization region, places the initramfs below the kernel's limit, and passes
 E820, text screen information and the command line. This is a baseline boot path,
-with a text boot menu, without UEFI, graphics, encryption, RAID/LVM or signature verification.
+with a text boot menu, without a graphical menu, encryption, RAID/LVM or signature verification.
 
 ## Validation
 
@@ -193,6 +245,26 @@ python3 tests/menu.py
 These cases run one 128 MiB QEMU guest at a time and retain logs under
 `build/menu-tests/`. Successful boot cases require the selected entry's command
 line and `ARKBOOT_USERSPACE_OK`; they cover FAT12 and ISO9660 menu paths.
+
+The test kernel config enables EFI stub support and disables IA32 mixed mode
+and the deprecated EFI handover protocol. With OVMF installed, run:
+
+```sh
+MKISOFS=/path/to/mkisofs python3 tests/uefi.py
+```
+
+`--ovmf-code` and `--ovmf-vars` override firmware discovery; `--case ext4-gpt`
+runs one case. UEFI tests run sequentially with 256 MiB guest RAM and a host
+memory preflight. They cover all supported filesystems, MBR/GPT, keyboard and
+serial selection, countdowns, invalid configuration, and IA32 kernel rejection.
+Logs are retained under `build/uefi-tests/`. To check BIOS boot from images
+containing both firmware entries:
+
+```sh
+MKISOFS=/path/to/mkisofs python3 tests/boot.py --dual-firmware
+```
+
+These BIOS logs are retained under `build/boot-tests-dual/`.
 
 See [docs/design.md](docs/design.md) for implementation references and layout,
 and [docs/validation.md](docs/validation.md) for the executed validation matrix.

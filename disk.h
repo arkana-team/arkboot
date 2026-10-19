@@ -1,7 +1,7 @@
 #ifndef ARKBOOT_DISK_H
 #define ARKBOOT_DISK_H
-#include "bios.h"
-struct disk { u8 drive; u32 block_size; u64 blocks; };
+#include "platform.h"
+struct disk { u8 drive; u32 block_size; u64 blocks; void *context; };
 struct partition { struct disk *disk; u64 base, size; };
 extern const char *fs_error;
 bool error(const char *s);
