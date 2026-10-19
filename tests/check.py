@@ -18,6 +18,7 @@ def run(*args):
 
 def main():
     os.chdir(REPO)
+    run(sys.executable, "tests/write_media.py")
     work = REPO / "build/check"
     root = work / "root"
     (root / "boot").mkdir(parents=True, exist_ok=True)

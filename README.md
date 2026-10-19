@@ -140,11 +140,20 @@ qemu-system-x86_64 -m 128 -cdrom arkboot.iso -boot order=d -serial stdio
 `--mkisofs /path/to/mkisofs` can select a non-system cdrtools binary. UDF bridge
 images are mounted through the UDF driver, rather than their ISO9660 fallback tree.
 
+## Install on CD or HDD
+
+See [the installation guide](docs/install.md) for burning an ISO, writing a
+complete disk image to an HDD/SSD/USB disk, or adding UEFI Arkboot to an existing
+EFI System Partition. `scripts/write-media.py` previews commands by default;
+physical writing requires `--write` and interactive device confirmation.
+Whole-disk writing replaces the target's partition table and existing partitions.
+
 ## x86-64 UEFI images
 
 UEFI requires an **x86-64 Linux kernel built with `CONFIG_EFI_STUB=y`**.
 Initramfs loading also requires support for Linux's Load File 2 provider protocol;
-this path is validated with Linux 6.12. The same kernel can also boot through BIOS. Arkboot loads it with UEFI image services,
+this path is validated with Linux 6.12. The same kernel can also boot through BIOS.
+Arkboot loads it with UEFI image services,
 passes the entry's command line as UTF-16 load options and supplies its initramfs
 through Linux's `EFI_LOAD_FILE2` protocol. The kernel's EFI stub performs the
 final memory-map and `ExitBootServices` handoff. IA32 UEFI is unsupported.

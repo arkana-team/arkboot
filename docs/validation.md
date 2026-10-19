@@ -142,3 +142,20 @@ rejection; logs are in `build/menu-tests/`.
 
 These results cover QEMU/OVMF with unsigned images. Physical UEFI firmware and
 Secure Boot trust/signing remain untested/unimplemented respectively.
+
+## Installation guide and media writer (2026-10-19)
+
+`python3 tests/write_media.py` passed 12 focused checks using temporary files
+and simulated block-device metadata. These cover image/media type mismatch,
+whole-device and sector-size requirements, mounted devices and swap, active
+RAID/LVM/encryption holders, read-only/undersized disks, missing sysfs metadata,
+confirmation and terminal requirements, changed devices/images, failure handling,
+and verification before GPT relocation. The helper defaults to preview.
+
+An additional integration check generated real Arkboot FAT12 MBR, ext4 GPT/UEFI
+and ISO9660/UEFI images with `scripts/mkimage.py`; the helper recognized each,
+rejected the wrong media kind, and its CLI refused regular files as destinations.
+Generation logs are retained under `build/write-media-tests/integration/`. Python
+compilation and CLI help checks passed. `make check` now includes the focused
+writer checks. No physical disk was written or optical disc burned; the writer's
+physical I/O, GPT relocation and optical media handling remain hardware-untested.
