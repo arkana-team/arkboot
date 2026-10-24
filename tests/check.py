@@ -18,6 +18,7 @@ def run(*args):
 
 def main():
     os.chdir(REPO)
+    run(sys.executable, "tests/image_builder.py")
     run(sys.executable, "tests/write_media.py")
     work = REPO / "build/check"
     root = work / "root"
