@@ -202,7 +202,7 @@ regular files reached through directories; symlinks are not followed.
 | FAT12/16/32 | Fixed and clustered roots, subdirectories, fragmented chains, active FAT selection, short and long names | ASCII case folding; BMP UTF-8 long names; no surrogate pairs |
 | ext2/3/4 | 1–64 KiB blocks, variable inode/descriptor sizes, 64-bit block addresses, direct/indirect blocks, extent trees, sparse files | Clean filesystems only; no journal replay, `meta_bg`, bigalloc, inline data, encryption, casefold or verity files; metadata checksums are not verified |
 | ISO9660 | Primary volume descriptor, directories, contiguous files, case-insensitive names and `;version` stripping | Uses primary ISO names, not Rock Ridge or Joliet; no multi-extent/interleaved files |
-| UDF | One physical type-1 partition map; FE/EFE; short/long/embedded allocation, continuation extents, holes; CS0 8/16-bit names | No VAT, sparable/metadata maps, indirect ICBs, symlinks or surrogate pairs; anchor at block 256 |
+| UDF | One physical type-1 partition map; FE/EFE; short/long/embedded allocation, continuation extents, holes; CS0 8/16-bit names | No VAT, sparable/metadata maps, indirect ICBs, symlinks or surrogate pairs; anchor at block 256; directory lookups limited to 65536 read requests/allocation descriptors/continuation reads combined |
 
 On disk, MBR primary/logical partitions and GPT are supported. GPT header and
 entry-array CRCs are checked. For BIOS, extended disk services (EDD) and E820 are

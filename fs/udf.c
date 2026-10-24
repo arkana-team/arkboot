@@ -95,7 +95,17 @@ bool udf_mount(struct volume *v) {
     }
     return false;
 }
-bool udf_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 size) {
+/* Charge requests (including embedded data), allocation descriptors and
+   continuation reads to one lookup-wide budget, even when blocks are aliased. */
+static bool lookup_work(u32 *budget) {
+    if (!budget) return true;
+    if (!*budget) return error("UDF directory lookup work limit exceeded");
+    --*budget;
+    return true;
+}
+static bool read_budgeted(struct volume *v, const struct node *f, u64 off, void *dst,
+                          u32 size, u32 *budget) {
+    if (!lookup_work(budget)) return false;
     u32 physical = 0;
     if (!partition_block(v, f->id, &physical)) return false;
     u32 type = rd32(f->meta + 8), ad_size = type == 0 ? 8 : 16;
@@ -106,12 +116,14 @@ bool udf_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 si
     while (size) {
         u8 ad[16];
         if (cursor > ads || ad_size > ads - cursor) return error("short UDF extent list");
+        if (!lookup_work(budget)) return false;
         if (!part_read(&v->part, base + cursor, ad, ad_size)) return false;
         cursor += ad_size;
         u32 raw = rd32(ad), kind = raw >> 30, len = raw & 0x3fffffff, lbn = rd32(ad + 4);
         if (!len || (type == 1 && rd16(ad + 8))) return error("invalid UDF extent/partition reference");
         if (kind == 3) {
             u8 b[4096];
+            if (!lookup_work(budget)) return false;
             if (++continuations > 64 || !partition_block(v, lbn, &physical) ||
                 !descriptor(v, physical, lbn, b, 258)) return error("invalid/cyclic UDF continuation");
             ads = rd32(b + 20); cursor = 0;
@@ -132,17 +144,21 @@ bool udf_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 si
     }
     return true;
 }
+bool udf_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 size) {
+    return read_budgeted(v, f, off, dst, size, NULL);
+}
 bool udf_lookup(struct volume *v, const struct node *dir, const char *name, struct node *out) {
+    u32 budget = 65536;
     for (u64 off = 0; off + 38 <= dir->size;) {
         u8 h[38], encoded[255];
-        if (!udf_read(v, dir, off, h, sizeof h)) return false;
+        if (!read_budgeted(v, dir, off, h, sizeof h, &budget)) return false;
         u32 imp = rd16(h + 36), len = h[19], record = (38 + imp + len + 3) & ~3u;
         u8 sum = 0;
         for (u32 i = 0; i < 16; i++) if (i != 4) sum += h[i];
         if (rd16(h) != 257 || sum != h[4] || record > dir->size - off)
             return error("invalid UDF file identifier");
         if (len && !(h[18] & (4 | 8))) {
-            if (!udf_read(v, dir, off + 38 + imp, encoded, len)) return false;
+            if (!read_budgeted(v, dir, off + 38 + imp, encoded, len, &budget)) return false;
             char decoded[256] = {0}; u32 n = 0, step = encoded[0] == 8 ? 1 : encoded[0] == 16 ? 2 : 0;
             if (!step || (len - 1) % step) return error("unsupported UDF filename encoding");
             for (u32 i = 1; i < len; i += step) {
