@@ -4,7 +4,9 @@ import contextlib
 import copy
 import importlib.util
 import io
+import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -121,7 +123,17 @@ class MediaWriterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             writer.image_info(self.image, "cd")
 
-    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None, kind="disk"):
+    @staticmethod
+    def iso_image():
+        iso = bytearray(20 * 2048)
+        for block, kind in ((16, 1), (17, 0), (18, 255)):
+            iso[block * 2048] = kind
+            iso[block * 2048 + 1:block * 2048 + 6] = b"CD001"
+        iso[17 * 2048 + 7:17 * 2048 + 30] = b"EL TORITO SPECIFICATION"
+        return iso
+
+    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None, kind="disk",
+               mock_blank_cd=False):
         validate = writer.validate_target
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -136,9 +148,18 @@ class MediaWriterTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(sys.stdin, "isatty", return_value=tty))
         self.input = stack.enter_context(mock.patch("builtins.input", return_value=response,
             side_effect=response if callable(response) else None))
-        self.open = stack.enter_context(mock.patch.object(writer.os, "open", return_value=123))
-        stack.enter_context(mock.patch.object(writer.os, "fstat", return_value=self.device.stat()))
-        self.close = stack.enter_context(mock.patch.object(writer.os, "close"))
+        real_open, real_fstat, real_close = os.open, os.fstat, os.close
+        self.open = mock.Mock(return_value=123)
+        self.close = mock.Mock()
+        stack.enter_context(mock.patch.object(writer.os, "open", side_effect=
+            lambda path, *args, **kwargs: self.open(path, *args, **kwargs) if path == self.device
+            else real_open(path, *args, **kwargs)))
+        stack.enter_context(mock.patch.object(writer.os, "fstat", side_effect=
+            lambda fd: self.device.stat() if fd == 123 else real_fstat(fd)))
+        stack.enter_context(mock.patch.object(writer.os, "close", side_effect=
+            lambda fd: self.close(fd) if fd == 123 else real_close(fd)))
+        if mock_blank_cd:
+            stack.enter_context(mock.patch.object(writer, "blank_cd"))
         self.run = stack.enter_context(mock.patch.object(writer, "run", side_effect=failure))
         with stack, contextlib.redirect_stdout(io.StringIO()):
             writer.main()
@@ -192,12 +213,115 @@ class MediaWriterTests(unittest.TestCase):
         self.close.assert_called_once_with(123)
         self.assertEqual(self.device.read_bytes(), b"untouched")
 
+    def test_source_replacement_after_validation_cannot_change_command_input(self):
+        secret = self.root / "private"
+        secret.write_bytes(b"private data must not be written to media")
+        secret.chmod(0o600)
+        for kind in ("disk", "cd"):
+            with self.subTest(kind=kind):
+                self.image.unlink()
+                expected = bytes(self.disk_image() if kind == "disk" else self.iso_image())
+                self.image.write_bytes(expected)
+                self.tree["type"] = "disk" if kind == "disk" else "rom"
+                self.tree["size"] = len(expected) * 2
+                snapshots = []
+
+                def execute(command):
+                    program = command[0]
+                    if program in ("wipefs", "xorriso"):
+                        self.image.unlink()
+                        self.image.symlink_to(secret)
+                    if program == "dd":
+                        source = pathlib.Path(next(arg[3:] for arg in command if arg.startswith("if=")))
+                    elif program == "cmp":
+                        source = pathlib.Path(command[-2])
+                    elif program == "xorriso":
+                        source = pathlib.Path(command[-1])
+                    else:
+                        return
+                    self.assertEqual(source.read_bytes(), expected)
+                    self.assertNotEqual(source, self.image)
+                    self.assertEqual(stat.S_IMODE(source.parent.stat().st_mode), 0o700)
+                    snapshots.append(source)
+                    if program in ("dd", "cmp"):
+                        subprocess.run(command, check=True, capture_output=True)
+
+                self.invoke(["--write"], response=str(self.device), failure=execute, kind=kind,
+                            mock_blank_cd=kind == "cd")
+                self.assertTrue(snapshots)
+                self.assertTrue(all(not path.parent.exists() for path in snapshots))
+                if kind == "disk":
+                    self.assertEqual(self.device.read_bytes(), expected)
+
     def test_command_failure_stops_remaining_writes_and_closes_device(self):
+        snapshots = []
+
+        def fail(command):
+            if command[0] == "dd":
+                snapshots.append(pathlib.Path(command[1][3:]))
+                raise subprocess.CalledProcessError(1, command)
+
         with self.assertRaises(subprocess.CalledProcessError):
-            self.invoke(["--write"], response=str(self.device),
-                        failure=subprocess.CalledProcessError(1, ["wipefs"]))
-        self.assertEqual(self.run.call_count, 1)
+            self.invoke(["--write"], response=str(self.device), failure=fail)
+        self.assertEqual(self.run.call_count, 2)
         self.close.assert_called_once_with(123)
+        self.assertEqual(len(snapshots), 1)
+        self.assertFalse(snapshots[0].parent.exists())
+
+    def test_snapshot_rejects_replaced_and_special_sources(self):
+        other = self.root / "other"
+        other.write_bytes(self.disk_image())
+        for replacement in ("symlink", "regular", "fifo"):
+            with self.subTest(replacement=replacement):
+                expected = writer.file_identity(self.image)
+                self.image.rename(self.root / (replacement + "-original"))
+                if replacement == "symlink":
+                    self.image.symlink_to(other)
+                elif replacement == "fifo":
+                    os.mkfifo(self.image)
+                else:
+                    self.image.write_bytes(self.disk_image())
+                with self.assertRaises((ValueError, OSError)):
+                    with writer.image_snapshot(self.image, expected):
+                        self.fail("Replaced source was accepted")
+                self.image.unlink()
+                self.image.write_bytes(self.disk_image())
+
+    def test_snapshot_keeps_open_source_when_path_is_replaced_during_copy(self):
+        expected = writer.file_identity(self.image)
+        copy_source = writer.shutil.copyfileobj
+
+        def replace(source, target, length):
+            self.image.unlink()
+            self.image.symlink_to(self.device)
+            copy_source(source, target, length)
+
+        with mock.patch.object(writer.shutil, "copyfileobj", side_effect=replace):
+            with writer.image_snapshot(self.image, expected) as snapshot:
+                self.assertEqual(snapshot.read_bytes(), self.disk_image())
+                self.assertEqual(snapshot.parent.parent, pathlib.Path("/tmp"))
+        self.assertFalse(snapshot.parent.exists())
+
+    def test_snapshot_refuses_in_place_changes_and_cleans_up_copy_failure(self):
+        copy_source = writer.shutil.copyfileobj
+        for fail_copy in (False, True):
+            with self.subTest(fail_copy=fail_copy):
+                expected = writer.file_identity(self.image)
+                snapshots = []
+
+                def change(source, target, length):
+                    snapshots.append(pathlib.Path(target.name))
+                    copy_source(source, target, length)
+                    if fail_copy:
+                        raise OSError("Copy failed")
+                    self.image.write_bytes(b"changed")
+
+                with mock.patch.object(writer.shutil, "copyfileobj", side_effect=change):
+                    with self.assertRaisesRegex((ValueError, OSError), "changed|Copy failed"):
+                        with writer.image_snapshot(self.image, expected):
+                            self.fail("Failed copy was accepted")
+                self.assertEqual(len(snapshots), 1)
+                self.assertFalse(snapshots[0].parent.exists())
 
     def test_cd_command(self):
         command = writer.commands("cd", self.image, pathlib.Path("/dev/sr0"), 4096, False, 8)[0]
