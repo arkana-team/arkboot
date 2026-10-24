@@ -204,6 +204,11 @@ regular files reached through directories; symlinks are not followed.
 | ISO9660 | Primary volume descriptor, directories, contiguous files, case-insensitive names and `;version` stripping | Uses primary ISO names, not Rock Ridge or Joliet; no multi-extent/interleaved files |
 | UDF | One physical type-1 partition map; FE/EFE; short/long/embedded allocation, continuation extents, holes; CS0 8/16-bit names | No VAT, sparable/metadata maps, indirect ICBs, symlinks or surrogate pairs; anchor at block 256 |
 
+Each ext directory lookup has a 65536-unit work budget, counting directory
+records, extent headers/entries, indirect pointers and 512-byte directory data
+sectors. Exceeding it stops lookup with an error, including on otherwise valid
+directories that require too much work for boot-time discovery.
+
 On disk, MBR primary/logical partitions and GPT are supported. GPT header and
 entry-array CRCs are checked. For BIOS, extended disk services (EDD) and E820 are
 required; there is no CHS fallback or native SATA/NVMe/USB driver. When BIOS omits optical capacity, an ISO primary volume descriptor is required
