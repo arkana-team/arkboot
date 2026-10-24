@@ -48,6 +48,11 @@ def main():
         "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Werror",
         "tests/ext_lookup_host.c", "disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", ext_harness)
     run(ext_harness)
+    udf_harness = work / "udf_host"
+    run("gcc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Werror",
+        "tests/udf_host.c", "disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", udf_harness)
+    run(udf_harness)
     harness = work / "fs_host"
     run("gcc", "-std=c11", "-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=undefined", "-fno-sanitize-recover=all",
         "-Wall", "-Wextra", "-Werror", "tests/fs_host.c", "disk.c", "bios_disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", harness)
