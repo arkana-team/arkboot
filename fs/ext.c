@@ -62,7 +62,16 @@ static bool inode_read(struct volume *v, u32 ino, struct node *out) {
     if (!out->directory) out->size |= (u64)rd32(out->meta + 108) << 32;
     return true;
 }
-static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *physical, u32 *run) {
+/* Shared by all mappings and records in one directory lookup. Charge data in
+   sectors too, so large blocks cannot turn a small image into unbounded I/O. */
+static bool lookup_work(u32 *budget, u32 cost) {
+    if (!budget) return true;
+    if (*budget < cost) return error("ext directory lookup budget exceeded");
+    *budget -= cost;
+    return true;
+}
+static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *physical,
+                      u32 *run, u32 *budget) {
     u32 bs = v->block_size;
     *run = 1;
     if (rd32(f->meta + 32) & 0x80000) {
@@ -71,6 +80,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         u64 base = 0;
         u32 capacity = 60, previous_depth = 6;
         for (u32 level = 0; level < 6; level++) {
+            if (!lookup_work(budget, 1)) return false;
             if (!level) memcpy(header, root, 12);
             else if (!part_read(&v->part, base, header, 12)) return false;
             u32 count = rd16(header + 2), max = rd16(header + 4), depth = rd16(header + 6);
@@ -81,6 +91,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
             bool found = false;
             u32 last_start = 0;
             for (u32 i = 0; i < count; i++) {
+                if (!lookup_work(budget, 1)) return false;
                 if (!level) memcpy(entry, root + 12 + i * 12, 12);
                 else if (!part_read(&v->part, base + 12 + i * 12, entry, 12)) return false;
                 u32 start = rd32(entry);
@@ -123,11 +134,18 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         span /= per;
         u32 slot = index / span;
         u8 word[4];
+        if (!lookup_work(budget, 1)) return false;
         if (!part_read(&v->part, (u64)pointer * bs + slot * 4, word, 4)) return false;
         pointer = rd32(word); index %= span;
     }
     *physical = pointer;
     return true;
+}
+static bool ext_data(struct volume *v, u64 physical, u32 within, void *dst, u32 size) {
+    if (!physical) { memset(dst, 0, size); return true; }
+    if (physical >= v->u.ext.blocks || size > (v->u.ext.blocks - physical) * v->block_size - within)
+        return error("ext data outside filesystem");
+    return part_read(&v->part, physical * v->block_size + within, dst, size);
 }
 bool ext_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 size) {
     u8 *out = dst;
@@ -135,34 +153,49 @@ bool ext_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 si
         u64 logical = off / v->block_size, physical = 0;
         if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
         u32 run, within = off % v->block_size;
-        if (!ext_block(v, f, logical, &physical, &run)) return false;
+        if (!ext_block(v, f, logical, &physical, &run, NULL)) return false;
         u32 n = min32(size, min32(run, UINT32_MAX / v->block_size) * v->block_size - within);
-        if (!physical) memset(out, 0, n);
-        else {
-            if (physical >= v->u.ext.blocks || n > (v->u.ext.blocks - physical) * v->block_size - within)
-                return error("ext data outside filesystem");
-            if (!part_read(&v->part, physical * v->block_size + within, out, n)) return false;
-        }
+        if (!ext_data(v, physical, within, out, n)) return false;
         out += n; off += n; size -= n;
     }
     return true;
 }
 bool ext_lookup(struct volume *v, const struct node *dir, const char *name, struct node *out) {
     if (!dir) return inode_read(v, 2, out);
+    /* Filesystem reads are serialized. Keep the largest supported block off
+       the BIOS stack; mapping state and budget are fresh for each lookup. */
+    static u8 block[65536];
+    u32 budget = 65536, run = 0;
+    u64 physical = 0;
     for (u64 off = 0; off + 8 <= dir->size;) {
-        u8 h[8]; char filename[256];
-        if (!ext_read(v, dir, off, h, 8)) return false;
-        u32 ino = rd32(h), len = rd16(h + 4), name_len = h[6];
-        if (v->block_size == 65536 && (len == 65535 || !len)) len = 65536;
-        if (len < 8 || len % 4 || len > dir->size - off ||
-            len > v->block_size - off % v->block_size || name_len > len - 8)
-            return error("invalid ext directory record");
-        if (ino) {
-            if (!ext_read(v, dir, off + 8, filename, name_len)) return false;
-            filename[name_len] = 0;
-            if (name_equal(filename, name, false)) return inode_read(v, ino, out);
+        if (!lookup_work(&budget, v->block_size / 512)) return false;
+        if (!run) {
+            u64 logical = off / v->block_size;
+            if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
+            if (!ext_block(v, dir, logical, &physical, &run, &budget)) return false;
         }
-        off += len;
+        u32 n = min32(v->block_size, dir->size - off);
+        if (!ext_data(v, physical, 0, block, n)) return false;
+        u32 within = 0;
+        for (; within + 8 <= n;) {
+            if (!lookup_work(&budget, 1)) return false;
+            const u8 *h = block + within;
+            u32 ino = rd32(h), len = rd16(h + 4), name_len = h[6];
+            if (v->block_size == 65536 && (len == 65535 || !len)) len = 65536;
+            if (len < 8 || len % 4 || len > n - within || name_len > len - 8)
+                return error("invalid ext directory record");
+            if (ino) {
+                char filename[256];
+                memcpy(filename, h + 8, name_len);
+                filename[name_len] = 0;
+                if (name_equal(filename, name, false)) return inode_read(v, ino, out);
+            }
+            within += len;
+        }
+        if (within != n && dir->size - off - within >= 8)
+            return error("invalid ext directory record");
+        off += n; run--;
+        if (physical) physical++;
     }
     return error("file not found");
 }
