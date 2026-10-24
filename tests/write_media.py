@@ -48,6 +48,15 @@ class MediaWriterTests(unittest.TestCase):
             data[512:520] = b"EFI PART"
         return data
 
+    @staticmethod
+    def iso_image():
+        data = bytearray(20 * 2048)
+        for block, kind in ((16, 1), (17, 0), (18, 255)):
+            data[block * 2048] = kind
+            data[block * 2048 + 1:block * 2048 + 6] = b"CD001"
+        data[17 * 2048 + 7:17 * 2048 + 30] = b"EL TORITO SPECIFICATION"
+        return data
+
     def validate(self, tree=None, kind="disk", size=2048, swaps=None):
         writer.validate_target(tree or self.tree, kind, size, swaps or set(), self.sysfs)
 
@@ -102,11 +111,7 @@ class MediaWriterTests(unittest.TestCase):
         self.image.write_bytes(b"not a disk image")
         with self.assertRaises(ValueError):
             writer.image_info(self.image, "disk")
-        iso = bytearray(20 * 2048)
-        for block, kind in ((16, 1), (17, 0), (18, 255)):
-            iso[block * 2048] = kind
-            iso[block * 2048 + 1:block * 2048 + 6] = b"CD001"
-        iso[17 * 2048 + 7:17 * 2048 + 30] = b"EL TORITO SPECIFICATION"
+        iso = self.iso_image()
         self.image.write_bytes(iso)
         self.assertEqual(writer.image_info(self.image, "cd"), (len(iso), False))
         with self.assertRaises(ValueError):
@@ -116,11 +121,11 @@ class MediaWriterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             writer.image_info(self.image, "cd")
 
-    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None):
+    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None, kind="disk"):
         validate = writer.validate_target
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(mock.patch.object(sys, "argv", ["write-media.py", "disk",
+        stack.enter_context(mock.patch.object(sys, "argv", ["write-media.py", kind,
                                                            str(self.image), str(self.device), *flags]))
         stack.enter_context(mock.patch.object(writer, "device_tree", side_effect=[self.tree, fresh or self.tree]))
         stack.enter_context(mock.patch.object(writer, "validate_target", side_effect=
@@ -194,19 +199,82 @@ class MediaWriterTests(unittest.TestCase):
         self.assertEqual(self.run.call_count, 1)
         self.close.assert_called_once_with(123)
 
-    def test_cd_command_and_blank_disc_check(self):
+    def test_cd_command(self):
         command = writer.commands("cd", self.image, pathlib.Path("/dev/sr0"), 4096, False, 8)[0]
         self.assertIn("-sao", command)
         self.assertIn("speed=8", command)
         self.assertIn("-eject", command)
         self.assertFalse(any(arg.startswith("blank=") for arg in command))
-        with mock.patch.object(writer, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "", "Media status : is blank\n")):
-            writer.blank_cd(pathlib.Path("/dev/sr0"))
-        with mock.patch.object(writer, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "", "Media status : is written , is appendable\n")):
-            with self.assertRaisesRegex(ValueError, "blank"):
-                writer.blank_cd(pathlib.Path("/dev/sr0"))
+
+    def test_accept_blank_cd_profiles(self):
+        for profile in ("CD-R", "CD-RW"):
+            report = f"Media current: {profile}\nMedia status : is blank\n"
+            for stdout, stderr in ((report, ""), ("", report), (report, report)):
+                with self.subTest(profile=profile, stdout=stdout, stderr=stderr):
+                    with mock.patch.object(writer, "run", return_value=subprocess.CompletedProcess(
+                            [], 0, stdout, stderr)) as run:
+                        writer.blank_cd(pathlib.Path("/dev/sr0"))
+                    run.assert_called_once_with(
+                        ["xorriso", "-no_rc", "-indev", "/dev/sr0", "-toc"],
+                        capture_output=True, text=True)
+
+    def test_refuse_nonblank_or_ambiguous_cd_status(self):
+        blank = "Media status : is blank\n"
+        written = "Media status : is written , is appendable\n"
+        label = "Volume id    : 'Media status : is blank'\n"
+        for stdout, stderr in (
+                ("", ""), (label, ""), (written + label, ""), (written, label),
+                (written + "ISO session  :   1 , 0 , 100s , Media status : is blank\n", ""),
+                ("Media status : is written , is closed\n", ""),
+                ("Media status : is not present\n", ""),
+                ("Media status : is not recognizable\n", ""),
+                ("Media status : is blank , but next track is damaged\n", ""),
+                ("Media status : is blank , but no writable address\n", ""),
+                (blank + written, ""), (written + blank, ""), (blank, written),
+                (written + "Volume id    : '\n" + blank + "'\n", "")):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                with mock.patch.object(writer, "run", return_value=subprocess.CompletedProcess(
+                        [], 0, "Media current: CD-RW\n" + stdout, stderr)):
+                    with self.assertRaisesRegex(ValueError, "blank CD-R"):
+                        writer.blank_cd(pathlib.Path("/dev/sr0"))
+
+    def test_refuse_unsupported_or_ambiguous_media_profiles(self):
+        for profile in ("", "CD-ROM", "DVD+RW", "DVD-RW sequential recording", "DVD-RAM",
+                        "BD-RE", "BD-R", "is not recognizable", "CD-RW, overwriteable",
+                        "CD-RW\nMedia current: DVD+RW", "CD-R\nMedia current: CD-RW"):
+            with self.subTest(profile=profile):
+                report = f"Media current: {profile}\n" if profile else ""
+                with mock.patch.object(writer, "run", return_value=subprocess.CompletedProcess(
+                        [], 0, report + "Media status : is blank\n", "")):
+                    with self.assertRaisesRegex(ValueError, "blank CD-R"):
+                        writer.blank_cd(pathlib.Path("/dev/sr0"))
+
+    def test_cd_checks_media_before_confirmation_and_before_burning(self):
+        self.image.write_bytes(self.iso_image())
+        self.tree["type"] = "rom"
+        blank = subprocess.CompletedProcess(
+            [], 0, "Media current: CD-RW\nMedia status : is blank\n", "")
+        unsafe = subprocess.CompletedProcess(
+            [], 0, "Media current: DVD+RW\nMedia status : is written , is appendable\n",
+            "Volume id    : 'Media status : is blank'\n")
+        for inspections in ([unsafe], [blank, unsafe], [blank, blank]):
+            with self.subTest(inspections=inspections):
+                kwargs = dict(flags=["--write"], kind="cd", response=str(self.device),
+                              failure=[*inspections, None])
+                if inspections[-1] is unsafe:
+                    with self.assertRaisesRegex(ValueError, "blank CD-R"):
+                        self.invoke(**kwargs)
+                    self.assertEqual(self.run.call_count, len(inspections))
+                else:
+                    self.invoke(**kwargs)
+                    self.assertIn("cdrecord", self.run.call_args.args[0])
+                    self.assertEqual(self.run.call_count, 3)
+                if len(inspections) == 1:
+                    self.input.assert_not_called()
+                else:
+                    self.input.assert_called_once()
+                self.open.assert_not_called()
+                self.assertEqual(self.device.read_bytes(), b"untouched")
 
 
 if __name__ == "__main__":

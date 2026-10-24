@@ -126,7 +126,13 @@ def commands(kind, image, device, size, gpt, speed=None):
 def blank_cd(device):
     result = run(["xorriso", "-no_rc", "-indev", str(device), "-toc"],
                  capture_output=True, text=True)
-    if "Media status : is blank" not in result.stdout + result.stderr:
+    # Drive acquisition and -toc can repeat records. Require agreement on the
+    # complete records so a volume label cannot authorize a nonblank disc.
+    lines = result.stdout.splitlines() + result.stderr.splitlines()
+    statuses = {line for line in lines if line.startswith("Media status :")}
+    profiles = {line for line in lines if line.startswith("Media current:")}
+    if (statuses != {"Media status : is blank"}
+            or profiles not in ({"Media current: CD-R"}, {"Media current: CD-RW"})):
         raise ValueError("Insert a blank CD-R or already-blanked CD-RW; this helper does not erase discs")
 
 
