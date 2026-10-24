@@ -132,7 +132,8 @@ class MediaWriterTests(unittest.TestCase):
         iso[17 * 2048 + 7:17 * 2048 + 30] = b"EL TORITO SPECIFICATION"
         return iso
 
-    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None, kind="disk"):
+    def invoke(self, flags=(), response=None, tty=True, fresh=None, failure=None, kind="disk",
+               mock_blank_cd=False):
         validate = writer.validate_target
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -157,7 +158,8 @@ class MediaWriterTests(unittest.TestCase):
             lambda fd: self.device.stat() if fd == 123 else real_fstat(fd)))
         stack.enter_context(mock.patch.object(writer.os, "close", side_effect=
             lambda fd: self.close(fd) if fd == 123 else real_close(fd)))
-        stack.enter_context(mock.patch.object(writer, "blank_cd"))
+        if mock_blank_cd:
+            stack.enter_context(mock.patch.object(writer, "blank_cd"))
         self.run = stack.enter_context(mock.patch.object(writer, "run", side_effect=failure))
         with stack, contextlib.redirect_stdout(io.StringIO()):
             writer.main()
@@ -244,7 +246,8 @@ class MediaWriterTests(unittest.TestCase):
                     if program in ("dd", "cmp"):
                         subprocess.run(command, check=True, capture_output=True)
 
-                self.invoke(["--write"], response=str(self.device), failure=execute, kind=kind)
+                self.invoke(["--write"], response=str(self.device), failure=execute, kind=kind,
+                            mock_blank_cd=kind == "cd")
                 self.assertTrue(snapshots)
                 self.assertTrue(all(not path.parent.exists() for path in snapshots))
                 if kind == "disk":
