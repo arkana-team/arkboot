@@ -32,6 +32,62 @@ def check_output(path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def copy_root(root, tree):
+    """Snapshot a resolved root without following mutable source pathnames."""
+    # Make the component walk work for the relative ROOT used by the Makefile,
+    # while preserving symlink components so O_NOFOLLOW can reject them.
+    root = pathlib.Path(os.path.abspath(root))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def identity(info):
+        common = (info.st_dev, info.st_ino, info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            return common
+        return common + (info.st_size, info.st_mtime_ns)
+
+    def copy_directory(source, destination):
+        original = os.fstat(source)
+        destination.mkdir()
+        for name in os.listdir(source):
+            observed = os.stat(name, dir_fd=source, follow_symlinks=False)
+            mode = observed.st_mode
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise ValueError(f"Only regular files/directories are supported in boot trees: {name}")
+            flags = directory_flags if stat.S_ISDIR(mode) else os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open(name, flags, dir_fd=source)
+            try:
+                opened = os.fstat(descriptor)
+                if identity(opened) != identity(observed):
+                    raise ValueError(f"Boot tree changed while being staged: {name}")
+                target = destination / name
+                if stat.S_ISDIR(opened.st_mode):
+                    copy_directory(descriptor, target)
+                elif stat.S_ISREG(opened.st_mode):
+                    with os.fdopen(descriptor, "rb", closefd=False) as src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    if identity(os.fstat(descriptor)) != identity(opened):
+                        raise ValueError(f"Boot tree changed while being staged: {name}")
+                    shutil.copystat(descriptor, target)
+                else:
+                    raise ValueError(f"Only regular files/directories are supported in boot trees: {name}")
+            finally:
+                os.close(descriptor)
+        if identity(os.fstat(source)) != identity(original):
+            raise ValueError("Boot tree changed while being staged")
+        shutil.copystat(source, destination)
+
+    # Pin every component, including root's parents, before walking its entries.
+    source = os.open(root.anchor, directory_flags)
+    try:
+        for name in root.parts[1:]:
+            descriptor = os.open(name, directory_flags, dir_fd=source)
+            os.close(source)
+            source = descriptor
+        copy_directory(source, tree)
+    finally:
+        os.close(source)
+
+
 def partition(args, output, length):
     with output.open("wb") as stream:
         stream.truncate(length)
@@ -132,8 +188,7 @@ def disk(args):
 
 def iso(args):
     with tempfile.TemporaryDirectory(prefix="arkboot-", dir=args.output.parent) as tmp:
-        tree = pathlib.Path(tmp) / "root"
-        shutil.copytree(args.root, tree)
+        tree = args.root
         (tree / "boot").mkdir(exist_ok=True)
         image = tree / "boot" / "arkboot-cd.bin"
         boot = (REPO / "cdboot.bin").read_bytes().ljust(2048, b"\0")
@@ -179,16 +234,17 @@ def main():
         raise ValueError("Output must be outside the input tree")
     if not args.root.is_dir():
         raise ValueError("Root must be a directory")
-    for path in args.root.rglob("*"):
-        if path.is_symlink() or not (path.is_dir() or path.is_file()):
-            raise ValueError(f"Only regular files/directories are supported in boot trees: {path}")
-    if not any((args.root / directory / f"arkboot.{ext}").is_file()
-               for directory in ("boot", "") for ext in ("yaml", "yml", "cfg")):
-        raise ValueError("Boot tree must contain arkboot.yaml, arkboot.yml or arkboot.cfg in boot/ or root")
     for binary in ("boot.bin", "cdboot.bin", "loader.bin") + (("BOOTX64.EFI",) if args.uefi else ()):
         if not (REPO / binary).is_file():
             raise ValueError("Run make before generating images")
-    (disk if args.kind == "disk" else iso)(args)
+    with tempfile.TemporaryDirectory(prefix="arkboot-", dir=args.output.parent) as tmp:
+        tree = pathlib.Path(tmp) / "root"
+        copy_root(args.root, tree)
+        args.root = tree
+        if not any((args.root / directory / f"arkboot.{ext}").is_file()
+                   for directory in ("boot", "") for ext in ("yaml", "yml", "cfg")):
+            raise ValueError("Boot tree must contain arkboot.yaml, arkboot.yml or arkboot.cfg in boot/ or root")
+        (disk if args.kind == "disk" else iso)(args)
     print(f"Created {args.output}")
 
 
