@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Preview or write an Arkboot disk/CD image on Linux. Default: preview only."""
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -9,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 COLUMNS = "PATH,TYPE,SIZE,RO,MODEL,SERIAL,LOG-SEC,MOUNTPOINTS,MAJ:MIN"
@@ -19,8 +21,27 @@ def run(command, **kwargs):
 
 
 def file_identity(path):
-    info = path.stat()
+    info = os.stat(path)
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+@contextlib.contextmanager
+def image_snapshot(image, expected_identity):
+    # Pin the source before copying; refuse substitutions and special files.
+    fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        if (not stat.S_ISREG(os.fstat(fd).st_mode)
+                or file_identity(fd) != expected_identity):
+            raise ValueError("Image changed during confirmation")
+        # Ignore TMPDIR: the snapshot's parent must not be attacker-controlled.
+        # /tmp's sticky bit protects our private directory from replacement.
+        with tempfile.TemporaryDirectory(prefix="arkboot-media-", dir="/tmp") as directory:
+            snapshot = pathlib.Path(directory) / "image"
+            with snapshot.open("xb") as target:
+                shutil.copyfileobj(source, target, 1024 * 1024)
+            if file_identity(fd) != expected_identity:
+                raise ValueError("Image changed while copying")
+            yield snapshot
 
 
 def image_info(image, kind):
@@ -173,25 +194,27 @@ def main():
         raise ValueError("Confirmation did not match; nothing was written")
     # Recheck after confirmation; keep a disk exclusive-open during the write so
     # the kernel refuses mounted devices (including mounts in other namespaces).
-    current = device_tree(device)
-    if identity(current) != identity(tree) or device.stat().st_rdev != number:
-        raise ValueError("Target device changed during confirmation")
-    validate_target(current, args.kind, size, active_swaps())
-    if file_identity(image) != source_identity or image_info(image, args.kind) != (size, gpt):
-        raise ValueError("Image changed during confirmation")
-    if args.kind == "cd":
-        blank_cd(device)
-    fd = None
-    try:
-        if args.kind == "disk":
-            fd = os.open(device, os.O_RDWR | os.O_EXCL)
-            if os.fstat(fd).st_rdev != number:
-                raise ValueError("Device changed during confirmation")
-        for command in plan:
-            run(command)
-    finally:
-        if fd is not None:
-            os.close(fd)
+    with image_snapshot(image, source_identity) as snapshot:
+        if image_info(snapshot, args.kind) != (size, gpt):
+            raise ValueError("Image changed during confirmation")
+        plan = commands(args.kind, snapshot, device, size, gpt, args.speed)
+        current = device_tree(device)
+        if identity(current) != identity(tree) or device.stat().st_rdev != number:
+            raise ValueError("Target device changed during confirmation")
+        validate_target(current, args.kind, size, active_swaps())
+        if args.kind == "cd":
+            blank_cd(device)
+        fd = None
+        try:
+            if args.kind == "disk":
+                fd = os.open(device, os.O_RDWR | os.O_EXCL)
+                if os.fstat(fd).st_rdev != number:
+                    raise ValueError("Device changed during confirmation")
+            for command in plan:
+                run(command)
+        finally:
+            if fd is not None:
+                os.close(fd)
     print("Done. Disk bytes were compared before GPT relocation." if args.kind == "disk" else
           "Burn completed and disc ejected. Reinsert it to verify or boot it.")
 

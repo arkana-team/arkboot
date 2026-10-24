@@ -151,6 +151,11 @@ the device after confirmation and holds an exclusive block-device open during
 writing to reject mounted devices, including mounts outside the current
 namespace. Keep automounters and other disk tools stopped during installation.
 
+For both disk writing and CD burning, the helper copies the image into a
+root-private directory under `/tmp` after confirmation, validates that snapshot,
+and uses it for writing and comparison. Allow free space for a full image copy.
+The temporary copy is removed on completion or failure.
+
 After confirmation it:
 
 1. Removes old signatures on the whole target with `wipefs`, including obsolete
