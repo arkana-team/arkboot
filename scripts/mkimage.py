@@ -34,29 +34,46 @@ def check_output(path):
 
 def copy_root(root, tree):
     """Snapshot a resolved root without following mutable source pathnames."""
+    # Make the component walk work for the relative ROOT used by the Makefile,
+    # while preserving symlink components so O_NOFOLLOW can reject them.
+    root = pathlib.Path(os.path.abspath(root))
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
+    def identity(info):
+        common = (info.st_dev, info.st_ino, info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            return common
+        return common + (info.st_size, info.st_mtime_ns)
+
     def copy_directory(source, destination):
+        original = os.fstat(source)
         destination.mkdir()
         for name in os.listdir(source):
-            mode = os.stat(name, dir_fd=source, follow_symlinks=False).st_mode
+            observed = os.stat(name, dir_fd=source, follow_symlinks=False)
+            mode = observed.st_mode
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 raise ValueError(f"Only regular files/directories are supported in boot trees: {name}")
             flags = directory_flags if stat.S_ISDIR(mode) else os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             descriptor = os.open(name, flags, dir_fd=source)
             try:
-                mode = os.fstat(descriptor).st_mode
+                opened = os.fstat(descriptor)
+                if identity(opened) != identity(observed):
+                    raise ValueError(f"Boot tree changed while being staged: {name}")
                 target = destination / name
-                if stat.S_ISDIR(mode):
+                if stat.S_ISDIR(opened.st_mode):
                     copy_directory(descriptor, target)
-                elif stat.S_ISREG(mode):
+                elif stat.S_ISREG(opened.st_mode):
                     with os.fdopen(descriptor, "rb", closefd=False) as src, target.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
+                    if identity(os.fstat(descriptor)) != identity(opened):
+                        raise ValueError(f"Boot tree changed while being staged: {name}")
                     shutil.copystat(descriptor, target)
                 else:
                     raise ValueError(f"Only regular files/directories are supported in boot trees: {name}")
             finally:
                 os.close(descriptor)
+        if identity(os.fstat(source)) != identity(original):
+            raise ValueError("Boot tree changed while being staged")
         shutil.copystat(source, destination)
 
     # Pin every component, including root's parents, before walking its entries.

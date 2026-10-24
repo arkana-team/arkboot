@@ -47,6 +47,15 @@ class ImageBuilderTests(unittest.TestCase):
         self.payload.write_bytes(b"changed")
         self.assertEqual((self.tree / "boot/payload").read_bytes(), b"inside")
 
+    def test_copy_accepts_the_relative_root_used_by_make(self):
+        previous = pathlib.Path.cwd()
+        os.chdir(self.work)
+        try:
+            mkimage.copy_root(pathlib.Path("root"), pathlib.Path("relative-snapshot"))
+        finally:
+            os.chdir(previous)
+        self.assertEqual((self.work / "relative-snapshot/boot/payload").read_bytes(), b"inside")
+
     def test_reject_symlinks_and_fifo(self):
         entry = self.root / "entry"
         for target in (self.outside, self.outside / "payload", self.work / "missing"):
@@ -90,6 +99,27 @@ class ImageBuilderTests(unittest.TestCase):
                 if self.tree.exists():
                     shutil.rmtree(self.tree)
 
+    def test_reject_regular_file_substitution_at_open(self):
+        original_open = os.open
+        old = self.payload.with_name("payload-old")
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and path == self.payload.name and kwargs.get("dir_fd") is not None:
+                swapped = True
+                self.payload.rename(old)
+                self.payload.write_bytes(b"untrusted replacement")
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(mkimage.os, "open", side_effect=racing_open):
+            with self.assertRaisesRegex(ValueError, "changed while being staged"):
+                mkimage.copy_root(self.root, self.tree)
+        self.assertTrue(swapped)
+        self.assertEqual(old.read_bytes(), b"inside")
+        self.assertEqual(self.payload.read_bytes(), b"untrusted replacement")
+        shutil.rmtree(self.tree)
+
     def test_directory_descriptor_survives_path_replacement(self):
         original_listdir = os.listdir
         swapped = False
@@ -123,6 +153,24 @@ class ImageBuilderTests(unittest.TestCase):
             mkimage.copy_root(self.root, self.tree)
         self.assertTrue(swapped)
         self.assertEqual((self.tree / "boot/payload").read_bytes(), b"inside")
+
+    def test_reject_in_place_file_changes_during_snapshot(self):
+        original_copy = mkimage.shutil.copyfileobj
+        changed = False
+
+        def racing_copy(source, destination, length=0):
+            nonlocal changed
+            result = original_copy(source, destination, length)
+            if not changed and os.fstat(source.fileno()).st_ino == self.payload.stat().st_ino:
+                changed = True
+                self.payload.write_bytes(b"changed while copying")
+            return result
+
+        with mock.patch.object(mkimage.shutil, "copyfileobj", side_effect=racing_copy):
+            with self.assertRaisesRegex(ValueError, "changed while being staged"):
+                mkimage.copy_root(self.root, self.tree)
+        self.assertTrue(changed)
+        shutil.rmtree(self.tree)
 
     def test_reject_fifo_substitution_without_blocking(self):
         original_open = os.open
