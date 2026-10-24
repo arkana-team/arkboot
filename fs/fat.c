@@ -124,13 +124,34 @@ static u8 short_checksum(const u8 *s) {
     return sum;
 }
 bool fat_lookup(struct volume *v, const struct node *dir, const char *name, struct node *out) {
-    u8 e[32];
+    u8 entries[4096];
+    u32 cluster = dir->id, budget = v->u.fat.clusters;
+    u32 cluster_size = v->u.fat.cluster_size;
+    bool fixed_root = !dir->id && v->u.fat.bits != 32;
     u16 long_name[260];
     long_name[0] = 0xffff;
     u32 expected = 0;
     u8 checksum = 0;
     for (u64 offset = 0; offset + 32 <= dir->size; offset += 32) {
-        if (!fat_read(v, dir, offset, e, sizeof e)) return false;
+        if (!(offset % v->block_size)) {
+            u64 address = v->u.fat.root + offset;
+            if (!fixed_root) {
+                /* Retain the cursor and budget across all directory records. */
+                if (!(offset % cluster_size)) {
+                    if (!budget) return error("invalid/cyclic FAT directory chain");
+                    budget--;
+                    if (offset && (!next_cluster(v, cluster, &cluster) || !cluster))
+                        return error("short FAT directory chain");
+                    if (cluster < 2 || cluster >= v->u.fat.clusters + 2)
+                        return error("invalid FAT directory cluster");
+                }
+                address = v->u.fat.data + (u64)(cluster - 2) * cluster_size + offset % cluster_size;
+            }
+            u32 n = v->block_size;
+            if (dir->size - offset < n) n = dir->size - offset;
+            if (!part_read(&v->part, address, entries, n)) return false;
+        }
+        const u8 *e = entries + offset % v->block_size;
         if (!e[0]) break;
         if (e[0] == 0xe5) { expected = 0; long_name[0] = 0xffff; continue; }
         if (e[11] == 0x0f) {
