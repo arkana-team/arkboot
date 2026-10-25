@@ -277,3 +277,9 @@ These BIOS logs are retained under `build/boot-tests-dual/`.
 
 See [docs/design.md](docs/design.md) for implementation references and layout,
 and [docs/validation.md](docs/validation.md) for the executed validation matrix.
+
+## License
+
+Arkboot's original source is licensed under GNU GPL version 3; see
+[LICENSE](LICENSE). External tools, firmware interfaces, and other third-party
+components remain subject to their respective licenses.
