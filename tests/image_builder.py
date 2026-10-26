@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import uefi
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("mkimage", REPO / "scripts/mkimage.py")
 mkimage = importlib.util.module_from_spec(spec)
@@ -242,6 +244,109 @@ class ImageBuilderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.invoke("iso")
         self.assertEqual(output.read_bytes(), b"previous image")
+
+
+class UefiStagingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = pathlib.Path(self.tmp.name)
+        self.root = self.work / "source"
+        self.boot = self.root / "boot"
+        self.boot.mkdir(parents=True)
+        for name in ("vmlinuz", "initrd.img"):
+            (self.boot / name).write_bytes(name.encode())
+        self.outside = self.work / "private"
+        self.outside.mkdir()
+        for name in ("vmlinuz", "initrd.img"):
+            (self.outside / name).write_bytes(b"host secret")
+        self.firmware = self.work / "firmware.fd"
+        self.firmware.touch()
+        self.builder = mock.Mock(side_effect=self.build_image)
+        self.guest = mock.Mock()
+
+    def build_image(self, command, **kwargs):
+        staged = pathlib.Path(command[command.index("--root") + 1])
+        for name in ("vmlinuz", "initrd.img"):
+            self.assertEqual((staged / "boot" / name).read_bytes(), name.encode())
+        pathlib.Path(command[command.index("--output") + 1]).touch()
+
+    def invoke(self):
+        arguments = ["uefi.py", "--root", str(self.root), "--case", "ext4-gpt"]
+        previous = pathlib.Path.cwd()
+        try:
+            with mock.patch.object(uefi, "REPO", self.work), \
+                    mock.patch.object(uefi, "firmware_pair", return_value=(self.firmware, self.firmware)), \
+                    mock.patch.object(sys, "argv", arguments), \
+                    mock.patch.object(uefi.subprocess, "run", self.builder), \
+                    mock.patch.object(uefi, "boot", self.guest), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                uefi.main()
+        finally:
+            os.chdir(previous)
+
+    def test_regular_boot_files_reach_image_builder(self):
+        self.invoke()
+        self.builder.assert_called_once()
+        self.guest.assert_called_once()
+
+    def test_boot_files_are_selected_from_private_snapshot(self):
+        original_copy = shutil.copyfile
+        snapshots = []
+
+        def racing_copy(source, destination):
+            self.assertNotEqual(source, self.boot / source.name)
+            self.assertEqual(stat.S_IMODE(source.parents[2].stat().st_mode), 0o700)
+            if not snapshots:
+                self.boot.rename(self.root / "boot-old")
+                self.boot.symlink_to(self.outside)
+            snapshots.append(source)
+            return original_copy(source, destination)
+
+        with mock.patch.object(uefi.shutil, "copyfile", side_effect=racing_copy):
+            self.invoke()
+        self.assertEqual(len(snapshots), 2)
+        self.assertTrue(all(not source.exists() for source in snapshots))
+        self.builder.assert_called_once()
+        self.guest.assert_called_once()
+
+    def test_source_links_are_rejected_before_image_building(self):
+        for name in ("vmlinuz", "initrd.img", "boot"):
+            with self.subTest(name=name):
+                source = self.boot if name == "boot" else self.boot / name
+                saved = source.with_name(source.name + "-saved")
+                source.rename(saved)
+                source.symlink_to(self.outside if name == "boot" else self.outside / name)
+                try:
+                    with self.assertRaises((ValueError, OSError)):
+                        self.invoke()
+                    self.builder.assert_not_called()
+                    self.guest.assert_not_called()
+                    staged = self.work / "build/uefi-tests/root/boot"
+                    for filename in ("vmlinuz", "initrd.img"):
+                        self.assertFalse((staged / filename).exists())
+                finally:
+                    source.unlink()
+                    saved.rename(source)
+
+    def test_source_link_substitution_at_open_is_rejected(self):
+        original_open = os.open
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and path == "initrd.img" and kwargs.get("dir_fd") is not None:
+                swapped = True
+                (self.boot / path).unlink()
+                (self.boot / path).symlink_to(self.outside / path)
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, "open", side_effect=racing_open):
+            with self.assertRaises(OSError):
+                self.invoke()
+        self.assertTrue(swapped)
+        self.builder.assert_not_called()
+        self.guest.assert_not_called()
 
 
 if __name__ == "__main__":
