@@ -64,7 +64,16 @@ def copy_root(root, tree):
                     copy_directory(descriptor, target)
                 elif stat.S_ISREG(opened.st_mode):
                     with os.fdopen(descriptor, "rb", closefd=False) as src, target.open("wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                        # A concurrent sparse extension must not grow staging writes.
+                        remaining = opened.st_size
+                        while remaining:
+                            data = src.read(min(remaining, 1024 * 1024))
+                            if not data:
+                                raise ValueError(f"Boot tree changed while being staged: {name}")
+                            dst.write(data)
+                            remaining -= len(data)
+                        if src.read(1):
+                            raise ValueError(f"Boot tree changed while being staged: {name}")
                     if identity(os.fstat(descriptor)) != identity(opened):
                         raise ValueError(f"Boot tree changed while being staged: {name}")
                     shutil.copystat(descriptor, target)

@@ -138,39 +138,99 @@ class ImageBuilderTests(unittest.TestCase):
         self.assertEqual((self.tree / "boot/payload").read_bytes(), b"inside")
 
     def test_file_descriptor_survives_path_replacement(self):
-        original_copy = mkimage.shutil.copyfileobj
+        original_fdopen = os.fdopen
         swapped = False
 
-        def racing_copy(source, destination):
+        def racing_fdopen(descriptor, *args, **kwargs):
             nonlocal swapped
-            if not swapped and os.fstat(source.fileno()).st_ino == self.payload.stat().st_ino:
+            if not swapped and os.fstat(descriptor).st_ino == self.payload.stat().st_ino:
                 swapped = True
                 self.payload.unlink()
                 self.payload.symlink_to(self.outside / "payload")
-            return original_copy(source, destination)
+            return original_fdopen(descriptor, *args, **kwargs)
 
-        with mock.patch.object(mkimage.shutil, "copyfileobj", side_effect=racing_copy):
+        with mock.patch.object(mkimage.os, "fdopen", side_effect=racing_fdopen):
             mkimage.copy_root(self.root, self.tree)
         self.assertTrue(swapped)
         self.assertEqual((self.tree / "boot/payload").read_bytes(), b"inside")
 
     def test_reject_in_place_file_changes_during_snapshot(self):
-        original_copy = mkimage.shutil.copyfileobj
+        original_fdopen = os.fdopen
         changed = False
 
-        def racing_copy(source, destination, length=0):
+        def racing_fdopen(descriptor, *args, **kwargs):
             nonlocal changed
-            result = original_copy(source, destination, length)
-            if not changed and os.fstat(source.fileno()).st_ino == self.payload.stat().st_ino:
+            if not changed and os.fstat(descriptor).st_ino == self.payload.stat().st_ino:
                 changed = True
-                self.payload.write_bytes(b"changed while copying")
-            return result
+                info = os.fstat(descriptor)
+                self.payload.write_bytes(b"mutant")
+                os.utime(self.payload, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+            return original_fdopen(descriptor, *args, **kwargs)
 
-        with mock.patch.object(mkimage.shutil, "copyfileobj", side_effect=racing_copy):
+        with mock.patch.object(mkimage.os, "fdopen", side_effect=racing_fdopen):
             with self.assertRaisesRegex(ValueError, "changed while being staged"):
                 mkimage.copy_root(self.root, self.tree)
         self.assertTrue(changed)
         shutil.rmtree(self.tree)
+
+    def test_copy_empty_and_large_files(self):
+        (self.boot / "empty").touch()
+        data = bytes(range(256)) * 8193
+        self.payload.write_bytes(data)
+        mkimage.copy_root(self.root, self.tree)
+        self.assertEqual((self.tree / "boot/empty").read_bytes(), b"")
+        self.assertEqual((self.tree / "boot/payload").read_bytes(), data)
+
+    def test_sparse_growth_never_exceeds_opening_size(self):
+        original_fdopen = os.fdopen
+        for size in (0, 6, 2 * 1024 * 1024 + 17):
+            for timing in ("before read", "during read"):
+                with self.subTest(size=size, timing=timing), tempfile.TemporaryDirectory(dir=self.work) as tmp:
+                    tree = pathlib.Path(tmp) / "snapshot"
+                    self.payload.write_bytes(b"x" * size)
+                    changed = False
+
+                    def grow():
+                        nonlocal changed
+                        if not changed:
+                            changed = True
+                            with self.payload.open("r+b") as stream:
+                                stream.truncate(size + 4 * 1024 * 1024)
+
+                    def racing_fdopen(descriptor, *args, **kwargs):
+                        source = original_fdopen(descriptor, *args, **kwargs)
+                        if os.fstat(descriptor).st_ino == self.payload.stat().st_ino:
+                            if timing == "before read":
+                                grow()
+                            else:
+                                original_read = source.read
+
+                                def racing_read(length=-1):
+                                    data = original_read(length)
+                                    grow()
+                                    return data
+
+                                source.read = racing_read
+                        return source
+
+                    with mock.patch.object(mkimage.os, "fdopen", side_effect=racing_fdopen):
+                        with self.assertRaisesRegex(ValueError, "changed while being staged"):
+                            mkimage.copy_root(self.root, tree)
+                    self.assertTrue(changed)
+                    self.assertLessEqual((tree / "boot/payload").stat().st_size, size)
+
+    def test_reject_premature_eof(self):
+        original_fdopen = os.fdopen
+
+        def racing_fdopen(descriptor, *args, **kwargs):
+            if os.fstat(descriptor).st_ino == self.payload.stat().st_ino:
+                self.payload.write_bytes(b"")
+            return original_fdopen(descriptor, *args, **kwargs)
+
+        with mock.patch.object(mkimage.os, "fdopen", side_effect=racing_fdopen):
+            with self.assertRaisesRegex(ValueError, "changed while being staged"):
+                mkimage.copy_root(self.root, self.tree)
+        self.assertEqual((self.tree / "boot/payload").stat().st_size, 0)
 
     def test_reject_fifo_substitution_without_blocking(self):
         original_open = os.open
