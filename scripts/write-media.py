@@ -38,7 +38,16 @@ def image_snapshot(image, expected_identity):
         with tempfile.TemporaryDirectory(prefix="arkboot-media-", dir="/tmp") as directory:
             snapshot = pathlib.Path(directory) / "image"
             with snapshot.open("xb") as target:
-                shutil.copyfileobj(source, target, 1024 * 1024)
+                # Concurrent growth must not consume more than the accepted size.
+                remaining = expected_identity[2]
+                while remaining:
+                    chunk = source.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise ValueError("Image changed while copying")
+                    target.write(chunk)
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise ValueError("Image changed while copying")
             if file_identity(fd) != expected_identity:
                 raise ValueError("Image changed while copying")
             yield snapshot
