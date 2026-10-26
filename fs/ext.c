@@ -62,11 +62,10 @@ static bool inode_read(struct volume *v, u32 ino, struct node *out) {
     if (!out->directory) out->size |= (u64)rd32(out->meta + 108) << 32;
     return true;
 }
-/* Shared by all mappings and records in one directory lookup. Charge data in
-   sectors too, so large blocks cannot turn a small image into unbounded I/O. */
-static bool lookup_work(u32 *budget, u32 cost) {
-    if (!budget) return true;
-    if (*budget < cost) return error("ext directory lookup budget exceeded");
+/* Shared by all mappings in one read or directory lookup. Lookups also charge
+   records and data sectors to bound discovery work independently of block size. */
+static bool ext_work(u32 *budget, u32 cost) {
+    if (*budget < cost) return error("ext work budget exceeded");
     *budget -= cost;
     return true;
 }
@@ -80,7 +79,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         u64 base = 0;
         u32 capacity = 60, previous_depth = 6;
         for (u32 level = 0; level < 6; level++) {
-            if (!lookup_work(budget, 1)) return false;
+            if (!ext_work(budget, 1)) return false;
             if (!level) memcpy(header, root, 12);
             else if (!part_read(&v->part, base, header, 12)) return false;
             u32 count = rd16(header + 2), max = rd16(header + 4), depth = rd16(header + 6);
@@ -91,7 +90,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
             bool found = false;
             u32 last_start = 0;
             for (u32 i = 0; i < count; i++) {
-                if (!lookup_work(budget, 1)) return false;
+                if (!ext_work(budget, 1)) return false;
                 if (!level) memcpy(entry, root + 12 + i * 12, 12);
                 else if (!part_read(&v->part, base + 12 + i * 12, entry, 12)) return false;
                 u32 start = rd32(entry);
@@ -134,7 +133,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         span /= per;
         u32 slot = index / span;
         u8 word[4];
-        if (!lookup_work(budget, 1)) return false;
+        if (!ext_work(budget, 1)) return false;
         if (!part_read(&v->part, (u64)pointer * bs + slot * 4, word, 4)) return false;
         pointer = rd32(word); index %= span;
     }
@@ -149,11 +148,12 @@ static bool ext_data(struct volume *v, u64 physical, u32 within, void *dst, u32 
 }
 bool ext_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 size) {
     u8 *out = dst;
+    u32 budget = 65536;
     while (size) {
         u64 logical = off / v->block_size, physical = 0;
         if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
         u32 run, within = off % v->block_size;
-        if (!ext_block(v, f, logical, &physical, &run, NULL)) return false;
+        if (!ext_block(v, f, logical, &physical, &run, &budget)) return false;
         u32 n = min32(size, min32(run, UINT32_MAX / v->block_size) * v->block_size - within);
         if (!ext_data(v, physical, within, out, n)) return false;
         out += n; off += n; size -= n;
@@ -168,7 +168,7 @@ bool ext_lookup(struct volume *v, const struct node *dir, const char *name, stru
     u32 budget = 65536, run = 0;
     u64 physical = 0;
     for (u64 off = 0; off + 8 <= dir->size;) {
-        if (!lookup_work(&budget, v->block_size / 512)) return false;
+        if (!ext_work(&budget, v->block_size / 512)) return false;
         if (!run) {
             u64 logical = off / v->block_size;
             if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
@@ -178,7 +178,7 @@ bool ext_lookup(struct volume *v, const struct node *dir, const char *name, stru
         if (!ext_data(v, physical, 0, block, n)) return false;
         u32 within = 0;
         for (; within + 8 <= n;) {
-            if (!lookup_work(&budget, 1)) return false;
+            if (!ext_work(&budget, 1)) return false;
             const u8 *h = block + within;
             u32 ino = rd32(h), len = rd16(h + 4), name_len = h[6];
             if (v->block_size == 65536 && (len == 65535 || !len)) len = 65536;
