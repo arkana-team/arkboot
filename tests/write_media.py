@@ -99,29 +99,33 @@ class MediaWriterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block device"):
             writer.device_tree(self.device)
 
+    def image_info(self, kind):
+        with writer.open_image(self.image) as source:
+            return writer.image_info(source, kind)
+
     def test_image_type_checks(self):
-        self.assertEqual(writer.image_info(self.image, "disk"), (2048, False))
+        self.assertEqual(self.image_info("disk"), (2048, False))
         self.image.write_bytes(self.disk_image(gpt=True))
-        self.assertEqual(writer.image_info(self.image, "disk"), (2048, True))
+        self.assertEqual(self.image_info("disk"), (2048, True))
         with self.assertRaises(ValueError):
-            writer.image_info(self.image, "cd")
+            self.image_info("cd")
         broken = self.disk_image(gpt=True)
         broken[512:520] = b"not GPT!"
         self.image.write_bytes(broken)
         with self.assertRaises(ValueError):
-            writer.image_info(self.image, "disk")
+            self.image_info("disk")
         self.image.write_bytes(b"not a disk image")
         with self.assertRaises(ValueError):
-            writer.image_info(self.image, "disk")
+            self.image_info("disk")
         iso = self.iso_image()
         self.image.write_bytes(iso)
-        self.assertEqual(writer.image_info(self.image, "cd"), (len(iso), False))
+        self.assertEqual(self.image_info("cd"), (len(iso), False))
         with self.assertRaises(ValueError):
-            writer.image_info(self.image, "disk")
+            self.image_info("disk")
         iso[17 * 2048] = 255
         self.image.write_bytes(iso)
         with self.assertRaises(ValueError):
-            writer.image_info(self.image, "cd")
+            self.image_info("cd")
 
     @staticmethod
     def iso_image():
@@ -204,6 +208,71 @@ class MediaWriterTests(unittest.TestCase):
         self.run.assert_not_called()
         self.open.assert_not_called()
 
+    def test_ancestor_replacement_cannot_redirect_source(self):
+        for kind in ("disk", "cd"):
+            for stage in ("before_open", "after_open", "before_identity", "confirmation"):
+                with self.subTest(kind=kind, stage=stage):
+                    case = self.root / f"{kind}-{stage}"
+                    parent, private = case / "source", case / "private"
+                    parent.mkdir(parents=True)
+                    private.mkdir()
+                    self.image = parent / "image"
+                    expected = bytes(self.disk_image() if kind == "disk" else self.iso_image())
+                    self.image.write_bytes(expected)
+                    secret = bytearray(expected)
+                    secret[-16:] = b"private contents"
+                    (private / "image").write_bytes(secret)
+                    (private / "image").chmod(0o600)
+                    self.tree.update(type="disk" if kind == "disk" else "rom",
+                                     size=len(expected) * 2)
+                    swapped, copied = False, []
+                    real_open, real_identity = os.open, writer.file_identity
+
+                    def swap():
+                        nonlocal swapped
+                        if not swapped:
+                            parent.rename(case / "original")
+                            parent.symlink_to(private, target_is_directory=True)
+                            swapped = True
+
+                    def open_component(path, *args, **kwargs):
+                        ancestor = path == parent.name and kwargs.get("dir_fd") is not None
+                        if ancestor and stage == "before_open":
+                            swap()
+                        fd = real_open(path, *args, **kwargs)
+                        if ancestor and stage == "after_open":
+                            swap()
+                        return fd
+
+                    def identity(fd):
+                        if stage == "before_identity":
+                            swap()
+                        return real_identity(fd)
+
+                    def confirm(prompt):
+                        if stage == "confirmation":
+                            swap()
+                        return str(self.device)
+
+                    def execute(command):
+                        if command[0] in ("dd", "xorriso"):
+                            path = command[1][3:] if command[0] == "dd" else command[-1]
+                            copied.append(pathlib.Path(path).read_bytes())
+
+                    with mock.patch.object(writer.os, "open", side_effect=open_component), \
+                            mock.patch.object(writer, "file_identity", side_effect=identity):
+                        if stage == "before_open":
+                            with self.assertRaises(OSError):
+                                self.invoke(["--write"], response=confirm, failure=execute,
+                                            kind=kind, mock_blank_cd=kind == "cd")
+                            self.assertEqual(copied, [])
+                        else:
+                            self.invoke(["--write"], response=confirm, failure=execute,
+                                        kind=kind, mock_blank_cd=kind == "cd")
+                            self.assertEqual(copied, [expected])
+                    self.assertTrue(swapped)
+                    self.assertEqual(self.device.read_bytes(), b"untouched")
+
     def test_confirmed_gpt_plan_verifies_before_relocating(self):
         self.image.write_bytes(self.disk_image(gpt=True))
         self.invoke(["--write"], response=str(self.device))
@@ -268,27 +337,28 @@ class MediaWriterTests(unittest.TestCase):
         self.assertEqual(len(snapshots), 1)
         self.assertFalse(snapshots[0].parent.exists())
 
-    def test_snapshot_rejects_replaced_and_special_sources(self):
+    def test_open_rejects_symlinks_and_special_sources(self):
         other = self.root / "other"
         other.write_bytes(self.disk_image())
-        for replacement in ("symlink", "regular", "fifo"):
+        for replacement in ("symlink", "fifo", "directory"):
             with self.subTest(replacement=replacement):
-                expected = writer.file_identity(self.image)
                 self.image.rename(self.root / (replacement + "-original"))
                 if replacement == "symlink":
                     self.image.symlink_to(other)
                 elif replacement == "fifo":
                     os.mkfifo(self.image)
                 else:
-                    self.image.write_bytes(self.disk_image())
+                    self.image.mkdir()
                 with self.assertRaises((ValueError, OSError)):
-                    with writer.image_snapshot(self.image, expected):
+                    with writer.open_image(self.image):
                         self.fail("Replaced source was accepted")
-                self.image.unlink()
+                if self.image.is_dir():
+                    self.image.rmdir()
+                else:
+                    self.image.unlink()
                 self.image.write_bytes(self.disk_image())
 
     def test_snapshot_keeps_open_source_when_path_is_replaced_during_copy(self):
-        expected = writer.file_identity(self.image)
         copy_source = writer.shutil.copyfileobj
 
         def replace(source, target, length):
@@ -296,8 +366,10 @@ class MediaWriterTests(unittest.TestCase):
             self.image.symlink_to(self.device)
             copy_source(source, target, length)
 
-        with mock.patch.object(writer.shutil, "copyfileobj", side_effect=replace):
-            with writer.image_snapshot(self.image, expected) as snapshot:
+        with writer.open_image(self.image) as source, mock.patch.object(
+                writer.shutil, "copyfileobj", side_effect=replace):
+            expected = writer.file_identity(source.fileno())
+            with writer.image_snapshot(source, expected) as snapshot:
                 self.assertEqual(snapshot.read_bytes(), self.disk_image())
                 self.assertEqual(snapshot.parent.parent, pathlib.Path("/tmp"))
         self.assertFalse(snapshot.parent.exists())
@@ -306,7 +378,6 @@ class MediaWriterTests(unittest.TestCase):
         copy_source = writer.shutil.copyfileobj
         for fail_copy in (False, True):
             with self.subTest(fail_copy=fail_copy):
-                expected = writer.file_identity(self.image)
                 snapshots = []
 
                 def change(source, target, length):
@@ -316,9 +387,11 @@ class MediaWriterTests(unittest.TestCase):
                         raise OSError("Copy failed")
                     self.image.write_bytes(b"changed")
 
-                with mock.patch.object(writer.shutil, "copyfileobj", side_effect=change):
+                with writer.open_image(self.image) as source, mock.patch.object(
+                        writer.shutil, "copyfileobj", side_effect=change):
+                    expected = writer.file_identity(source.fileno())
                     with self.assertRaisesRegex((ValueError, OSError), "changed|Copy failed"):
-                        with writer.image_snapshot(self.image, expected):
+                        with writer.image_snapshot(source, expected):
                             self.fail("Failed copy was accepted")
                 self.assertEqual(len(snapshots), 1)
                 self.assertFalse(snapshots[0].parent.exists())
