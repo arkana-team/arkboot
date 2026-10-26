@@ -75,12 +75,20 @@ static bool next_cluster(struct volume *v, u32 cluster, u32 *next) {
     return true;
 }
 static bool chain_size(struct volume *v, u32 start, u64 *size) {
-    u32 cluster = start;
+    u32 cluster = start, checkpoint = start, power = 1, length = 0;
     *size = 0;
     for (u32 i = 0; i < v->u.fat.clusters; i++) {
+        if (i == 65536) return error("FAT directory chain work limit exceeded");
         if (!next_cluster(v, cluster, &cluster)) return false;
         *size += v->u.fat.cluster_size;
         if (!cluster) return true;
+        /* Brent's cycle detection uses the same links as sizing, with no
+           additional FAT reads or storage proportional to the volume. */
+        if (cluster == checkpoint) return error("cyclic FAT directory chain");
+        if (++length == power) {
+            checkpoint = cluster;
+            power *= 2; length = 0;
+        }
     }
     return error("cyclic FAT directory chain");
 }
