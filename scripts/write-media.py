@@ -22,17 +22,17 @@ def run(command, **kwargs):
 
 def file_identity(path):
     info = os.stat(path)
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
 @contextlib.contextmanager
 def image_snapshot(image, expected_identity):
-    # Pin the source before copying; refuse substitutions and special files.
+    # Pin the source before copying; ctime catches writes even if mtime is restored.
     fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as source:
         if (not stat.S_ISREG(os.fstat(fd).st_mode)
                 or file_identity(fd) != expected_identity):
-            raise ValueError("Image changed during confirmation")
+            raise ValueError("Image changed before copying")
         # Ignore TMPDIR: the snapshot's parent must not be attacker-controlled.
         # /tmp's sticky bit protects our private directory from replacement.
         with tempfile.TemporaryDirectory(prefix="arkboot-media-", dir="/tmp") as directory:
@@ -172,38 +172,38 @@ def main():
     if args.speed is not None and (args.kind != "cd" or args.speed < 1):
         parser.error("--speed must be a positive integer and is only for CD burning")
     image, device = args.image.resolve(strict=True), args.device.resolve(strict=True)
-    source_identity = file_identity(image)
-    size, gpt = image_info(image, args.kind)
-    tree = device_tree(device)
-    number = device.stat().st_rdev
-    validate_target(tree, args.kind, size, active_swaps())
-    plan = commands(args.kind, image, device, size, gpt, args.speed)
-    print(f"Image:  {image} ({size} bytes)")
-    print(f"Target: {device} ({tree['size']} bytes)")
-    print(f"Model:  {tree.get('model') or 'unknown'}; serial: {tree.get('serial') or 'unknown'}")
-    print("Replaces the ENTIRE DISK and its partition table." if args.kind == "disk" else "Burns a blank optical disc.")
-    for command in plan:
-        print("  " + shlex.join(command))
-    if not args.write:
-        print("Preview only. Add --write to write after typing the target device path.")
-        return
-    for command in plan:
-        if not shutil.which(command[0]):
-            raise ValueError(f"Required tool is missing: {command[0]}")
-    if os.geteuid() != 0:
-        raise ValueError("Run with sudo for --write")
-    if not sys.stdin.isatty():
-        raise ValueError("--write requires interactive confirmation in a terminal")
-    if args.kind == "cd":
-        blank_cd(device)
-    if input(f"Type the full target path {device} to continue: ").strip() != str(device):
-        raise ValueError("Confirmation did not match; nothing was written")
-    # Recheck after confirmation; keep a disk exclusive-open during the write so
-    # the kernel refuses mounted devices (including mounts in other namespaces).
-    with image_snapshot(image, source_identity) as snapshot:
-        if image_info(snapshot, args.kind) != (size, gpt):
-            raise ValueError("Image changed during confirmation")
-        plan = commands(args.kind, snapshot, device, size, gpt, args.speed)
+    if args.write:
+        if os.geteuid() != 0:
+            raise ValueError("Run with sudo for --write")
+        if not sys.stdin.isatty():
+            raise ValueError("--write requires interactive confirmation in a terminal")
+    with contextlib.ExitStack() as stack:
+        source = image
+        if args.write:
+            source = stack.enter_context(image_snapshot(image, file_identity(image)))
+        size, gpt = image_info(source, args.kind)
+        tree = device_tree(device)
+        number = device.stat().st_rdev
+        validate_target(tree, args.kind, size, active_swaps())
+        plan = commands(args.kind, source, device, size, gpt, args.speed)
+        print(f"Image:  {image} ({size} bytes)")
+        print(f"Target: {device} ({tree['size']} bytes)")
+        print(f"Model:  {tree.get('model') or 'unknown'}; serial: {tree.get('serial') or 'unknown'}")
+        print("Replaces the ENTIRE DISK and its partition table." if args.kind == "disk" else "Burns a blank optical disc.")
+        for command in plan:
+            print("  " + shlex.join(command))
+        if not args.write:
+            print("Preview only. Add --write to write after typing the target device path.")
+            return
+        for command in plan:
+            if not shutil.which(command[0]):
+                raise ValueError(f"Required tool is missing: {command[0]}")
+        if args.kind == "cd":
+            blank_cd(device)
+        if input(f"Type the full target path {device} to continue: ").strip() != str(device):
+            raise ValueError("Confirmation did not match; nothing was written")
+        # Recheck after confirmation; keep a disk exclusive-open during the write so
+        # the kernel refuses mounted devices (including mounts in other namespaces).
         current = device_tree(device)
         if identity(current) != identity(tree) or device.stat().st_rdev != number:
             raise ValueError("Target device changed during confirmation")
