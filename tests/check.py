@@ -16,6 +16,28 @@ def run(*args):
     subprocess.run([str(a) for a in args], check=True)
 
 
+def check_large_files(harness, work):
+    # Large sparse files keep physical storage small while exercising 64-bit sizes.
+    root = work / "large-root"
+    root.mkdir(exist_ok=True)
+    reference = root / "large.bin"
+    image = work / "large.img"
+    for size in ((1 << 32) - 1, 1 << 32, (1 << 32) + 1):
+        with reference.open("wb") as stream:
+            stream.truncate(size)
+            stream.seek(size - 3)
+            stream.write(b"end")
+        with image.open("wb") as stream:
+            stream.truncate(16 * 1024 * 1024)
+        run("mkfs.ext2", "-q", "-F", "-b", "4096", "-d", root, image)
+        # A zero-sized chunk used to hang at exactly 4 GiB remaining.
+        subprocess.run([str(arg) for arg in
+                        (harness, image, 512, "ext2/3/4", "/large.bin", reference)],
+                       check=True, timeout=60)
+    image.unlink()
+    reference.unlink()
+
+
 def main():
     os.chdir(REPO)
     run(sys.executable, "tests/image_builder.py")
@@ -56,6 +78,7 @@ def main():
     harness = work / "fs_host"
     run("gcc", "-std=c11", "-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=undefined", "-fno-sanitize-recover=all",
         "-Wall", "-Wextra", "-Werror", "tests/fs_host.c", "disk.c", "bios_disk.c", *sorted((REPO / "fs").glob("*.c")), "-o", harness)
+    check_large_files(harness, work)
     cases = [(fs, size, "mbr") for fs, size in
              (("fat12", 8), ("fat16", 32), ("fat32", 96), ("ext2", 32), ("ext3", 32), ("ext4", 32))]
     cases += [("fat32", 96, "gpt"), ("ext4", 32, "gpt")]
