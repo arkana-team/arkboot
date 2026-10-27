@@ -8,9 +8,13 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 from boot import REPO, available_kib
+
+sys.path.insert(0, str(REPO / "scripts"))
+from mkimage import copy_root
 
 
 def firmware_pair():
@@ -122,9 +126,14 @@ def main():
     os.chdir(REPO)
     work = REPO / "build/uefi-tests"
     root = work / "root"
-    (root / "boot").mkdir(parents=True, exist_ok=True)
-    for name in ("vmlinuz", "initrd.img"):
-        shutil.copyfile(source / "boot" / name, root / "boot" / name)
+    work.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="source-", dir=work) as tmp:
+        snapshot = pathlib.Path(tmp) / "root"
+        # Confine reads from the original tree before selecting boot files.
+        copy_root(source, snapshot)
+        (root / "boot").mkdir(parents=True, exist_ok=True)
+        for name in ("vmlinuz", "initrd.img"):
+            shutil.copyfile(snapshot / "boot" / name, root / "boot" / name)
     cases = [(f"{fs}-mbr", fs, size, "mbr", None, None) for fs, size in
              (("fat12", 72), ("fat16", 96), ("fat32", 160), ("ext2", 80), ("ext3", 80), ("ext4", 80))]
     cases += [("fat32-gpt", "fat32", 160, "gpt", None, None),
