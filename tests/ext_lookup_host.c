@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../fs.h"
 
@@ -53,46 +54,125 @@ static void missing(void) {
 static void budget_exceeded(void) {
     struct node out;
     assert(!ext_lookup(&volume, &directory, "missing", &out));
-    assert(fs_error && !strcmp(fs_error, "ext work budget exceeded"));
+    assert(fs_error && !strcmp(fs_error, "ext directory lookup budget exceeded"));
 }
 static void invalid_record(void) {
     struct node out;
     assert(!ext_lookup(&volume, &directory, "missing", &out));
     assert(fs_error && !strcmp(fs_error, "invalid ext directory record"));
 }
-static void read_budget_exceeded(void) {
+/* Exercise regular reads through the public bounds check with aliased data. */
+static void file_bytes(u64 off, u32 size, bool zero) {
+    u8 *out = malloc(size ? size : 1);
+    assert(out);
+    assert(fs_read(&volume, &directory, off, out, size));
+    for (u32 i = 0; i < size; i++) {
+        u8 expected = zero ? 0 : image[3 * volume.block_size + (off + i) % volume.block_size];
+        assert(out[i] == expected);
+    }
+    free(out);
+}
+static void file_budget_exceeded(u64 off, u32 size) {
+    u8 *out = malloc(size);
+    assert(out);
+    assert(!fs_read(&volume, &directory, off, out, size));
+    assert(fs_error && !strcmp(fs_error, "ext file mapping budget exceeded"));
+    free(out);
+}
+static void file_checks(void) {
+    for (u32 bs = 1024; bs <= 65536; bs *= 2) {
+        fixture(bs, 84, 1);
+        directory.directory = false;
+        /* Previously 3,654 metadata reads for 84 one-block extents. */
+        read_limit = 128;
+        file_bytes(0, directory.size, false);
+        assert(metadata_reads < 8 && data_reads == 84);
+        reads = metadata_reads = data_reads = 0;
+        file_bytes(17, directory.size - 34, false);
+        assert(metadata_reads < 8 && data_reads == 84);
+        /* A random read and a different inode get fresh traversal state. */
+        reads = metadata_reads = data_reads = 0;
+        file_bytes(70 * (u64)bs + 7, bs + 3, false);
+        file_bytes(3, bs + 5, false);
+        assert(metadata_reads < 12);
+        header(directory.meta + 40, 1, 4, 0);
+        memset(directory.meta + 52, 0, 12);
+        extent(directory.meta + 52, 0, 1, 3);
+        file_bytes(0, bs, false);
+        /* Sparse and unwritten extents keep their zero-fill semantics. */
+        header(directory.meta + 40, 2, 4, 0);
+        extent(directory.meta + 52, 2, 32769, 3);
+        extent(directory.meta + 64, 4, 1, 3);
+        file_bytes(1, 4 * bs - 1, true);
+        file_bytes(4 * (u64)bs, bs, false);
+    }
+
+    /* Full 64 KiB leaves must use batches, including a random read near EOF. */
+    fixture(65536, (65536 - 12) / 12, 1);
     directory.directory = false;
-    directory.size = sizeof file_data;
-    read_limit = 131072;
-    assert(!fs_read(&volume, &directory, 0, file_data, sizeof file_data));
-    assert(fs_error && !strcmp(fs_error, "ext work budget exceeded"));
-    assert(reads < 131072);
-    /* Exhaustion must not leak into a subsequent independent request. */
-    assert(fs_read(&volume, &directory, 12 * volume.block_size, file_data, 1));
+    read_limit = 300;
+    file_bytes(0, 256 * 65536, false);
+    assert(metadata_reads < 12);
+    reads = metadata_reads = data_reads = 0;
+    file_bytes(directory.size - 65536 - 17, 65536 + 17, false);
+    assert(metadata_reads < 175);
+
+    /* Cross leaves at depth two, then at the maximum supported depth. Each
+       index selects two leaves that reuse the same physical data block. */
+    for (u32 depth = 2; depth <= 5; depth += 3) {
+        fixture(1024, 84, 1);
+        directory.directory = false;
+        header(directory.meta + 40, 1, 4, depth);
+        wr32(directory.meta + 56, 4);
+        for (u32 level = depth - 1; level > 1; level--) {
+            u32 block = 4 + depth - 1 - level;
+            header(image + block * 1024, 1, 84, level);
+            wr32(image + block * 1024 + 16, block + 1);
+        }
+        u8 *index = image + (depth + 2) * 1024;
+        header(index, 2, 84, 1);
+        wr32(index + 16, 2);
+        wr32(index + 24, 84); wr32(index + 28, 9);
+        memcpy(image + 9 * 1024, image + 2 * 1024, 1024);
+        for (u32 i = 0; i < 84; i++) wr32(image + 9 * 1024 + 12 + i * 12, 84 + i);
+        directory.size *= 2;
+        read_limit = 200;
+        file_bytes(0, directory.size, false);
+        /* Cached paths must not hide work: a long sparse tail still stops. */
+        directory.size = 16384 * 1024;
+        reads = 0; read_limit = 1000;
+        file_budget_exceeded(0, directory.size);
+        assert(reads < 200);
+        /* Neither cache nor exhausted budget leaks into the next call. */
+        reads = 0;
+        file_bytes(0, 1024, false);
+    }
+
+    /* Legacy indirect mapping shares the cumulative file-read budget. */
+    fixture(1024, 1, 1);
+    directory.directory = false;
+    wr32(directory.meta + 32, 0);
+    memset(directory.meta + 40, 0, 60);
+    wr32(directory.meta + 92, 2);
+    for (u32 i = 0; i < 256; i++) {
+        wr32(image + 2 * 1024 + i * 4, 4);
+        wr32(image + 4 * 1024 + i * 4, 3);
+    }
+    directory.size = (u64)(12 + 256 + 32769) * 1024;
+    read_limit = 100000;
+    file_budget_exceeded((12 + 256) * 1024, 32769 * 1024);
+    assert(reads == 65536 + data_reads && data_reads == 32768);
+
+    /* Resuming from a cursor must still reject an unordered leaf entry. */
+    fixture(1024, 84, 1);
+    directory.directory = false;
+    wr32(image + 2 * 1024 + 12 + 40 * 12, 39);
+    u8 out[42 * 1024];
+    assert(!fs_read(&volume, &directory, 0, out, sizeof out));
+    assert(fs_error && !strcmp(fs_error, "unordered ext extents"));
+    puts("ext regular-file mapping checks passed");
 }
 int main(void) {
-    /* Regular-file reads must share a budget across mappings. Small extent
-       trees can otherwise cause millions of reads, including across holes. */
-    for (u32 bs = 1024; bs <= 65536; bs *= 2) {
-        fixture(bs, (bs - 12) / 12, 1);
-        read_budget_exceeded();
-    }
-    fixture(1024, 1, 1);
-    extent(image + 2 * 1024 + 12, sizeof file_data / 1024, 1, 3);
-    read_budget_exceeded();
-    fixture(1024, 1, 1);
-    header(directory.meta + 40, 1, 4, 0);
-    extent(directory.meta + 52, sizeof file_data / 1024, 1, 3);
-    read_budget_exceeded();
-
-    /* Legacy indirect pointers are subject to the same cumulative limit. */
-    fixture(1024, 1, 1);
-    memset(directory.meta + 32, 0, 68);
-    wr32(directory.meta + 88, 2);
-    wr32(directory.meta + 92, 2);
-    for (u32 i = 0; i < 1024 / 4; i++) wr32(image + 2 * 1024 + i * 4, 2);
-    read_budget_exceeded();
-
     /* A large unwritten extent costs metadata work, not its byte length. */
     fixture(2048, 1, 1);
     directory.directory = false;
@@ -208,6 +288,7 @@ int main(void) {
     invalid_record();
     directory.size = 1024;
     missing();
-    puts("ext directory lookup and file read checks passed");
+    puts("ext directory lookup checks passed");
+    file_checks();
     return 0;
 }

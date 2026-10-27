@@ -62,15 +62,25 @@ static bool inode_read(struct volume *v, u32 ino, struct node *out) {
     if (!out->directory) out->size |= (u64)rd32(out->meta + 108) << 32;
     return true;
 }
-/* Shared by all mappings in one read or directory lookup. Lookups also charge
-   records and data sectors to bound discovery work independently of block size. */
-static bool ext_work(u32 *budget, u32 cost) {
-    if (*budget < cost) return error("ext work budget exceeded");
-    *budget -= cost;
+struct ext_budget {
+    u32 left;
+    const char *message;
+};
+static bool charge_work(struct ext_budget *budget, u32 cost) {
+    if (budget->left < cost) return error(budget->message);
+    budget->left -= cost;
     return true;
 }
+/* A read advances monotonically. Retain the selected entry and its predecessor
+   at each level, and fetch entries in batches instead of individual I/O calls. */
+struct extent_cursor {
+    bool valid;
+    u64 base;
+    u32 begin, previous_start, first, cached;
+    u8 header[12], entries[32 * 12];
+};
 static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *physical,
-                      u32 *run, u32 *budget) {
+                      u32 *run, struct ext_budget *budget, struct extent_cursor *cursor) {
     u32 bs = v->block_size;
     *run = 1;
     if (rd32(f->meta + 32) & 0x80000) {
@@ -79,8 +89,16 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         u64 base = 0;
         u32 capacity = 60, previous_depth = 6;
         for (u32 level = 0; level < 6; level++) {
-            if (!ext_work(budget, 1)) return false;
-            if (!level) memcpy(header, root, 12);
+            if (!charge_work(budget, 1)) return false;
+            struct extent_cursor *c = cursor ? &cursor[level] : NULL;
+            if (c && (!c->valid || c->base != base)) {
+                memset(c, 0, sizeof *c);
+                if (!level) memcpy(c->header, root, 12);
+                else if (!part_read(&v->part, base, c->header, 12)) return false;
+                c->valid = true; c->base = base;
+            }
+            if (c) memcpy(header, c->header, 12);
+            else if (!level) memcpy(header, root, 12);
             else if (!part_read(&v->part, base, header, 12)) return false;
             u32 count = rd16(header + 2), max = rd16(header + 4), depth = rd16(header + 6);
             if (rd16(header) != 0xf30a || count > max || max > (capacity - 12) / 12 ||
@@ -88,15 +106,23 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
                 return error("invalid ext extent tree");
             previous_depth = depth;
             bool found = false;
-            u32 last_start = 0;
-            for (u32 i = 0; i < count; i++) {
-                if (!ext_work(budget, 1)) return false;
+            u32 last_start = c ? c->previous_start : 0;
+            for (u32 i = c ? c->begin : 0; i < count; i++) {
+                if (!charge_work(budget, 1)) return false;
                 if (!level) memcpy(entry, root + 12 + i * 12, 12);
-                else if (!part_read(&v->part, base + 12 + i * 12, entry, 12)) return false;
+                else if (c) {
+                    if (i < c->first || i - c->first >= c->cached) {
+                        c->first = i; c->cached = min32(32, count - i);
+                        if (!part_read(&v->part, base + 12 + i * 12, c->entries, c->cached * 12))
+                            return false;
+                    }
+                    memcpy(entry, c->entries + (i - c->first) * 12, 12);
+                } else if (!part_read(&v->part, base + 12 + i * 12, entry, 12)) return false;
                 u32 start = rd32(entry);
                 if (i && start <= last_start) return error("unordered ext extents");
-                last_start = start;
                 if (start > logical) break;
+                if (c) { c->begin = i; c->previous_start = last_start; }
+                last_start = start;
                 if (depth) { *physical = (u64)rd16(entry + 8) << 32 | rd32(entry + 4); found = true; }
                 else {
                     u32 length = rd16(entry + 4);
@@ -133,7 +159,7 @@ static bool ext_block(struct volume *v, const struct node *f, u32 logical, u64 *
         span /= per;
         u32 slot = index / span;
         u8 word[4];
-        if (!ext_work(budget, 1)) return false;
+        if (!charge_work(budget, 1)) return false;
         if (!part_read(&v->part, (u64)pointer * bs + slot * 4, word, 4)) return false;
         pointer = rd32(word); index %= span;
     }
@@ -147,13 +173,17 @@ static bool ext_data(struct volume *v, u64 physical, u32 within, void *dst, u32 
     return part_read(&v->part, physical * v->block_size + within, dst, size);
 }
 bool ext_read(struct volume *v, const struct node *f, u64 off, void *dst, u32 size) {
+    /* Reads are serialized; keep cached metadata off the BIOS stack and reset
+       it for every call so other files, volumes and random reads start fresh. */
+    static struct extent_cursor cursor[6];
+    memset(cursor, 0, sizeof cursor);
+    struct ext_budget budget = {65536, "ext file mapping budget exceeded"};
     u8 *out = dst;
-    u32 budget = 65536;
     while (size) {
         u64 logical = off / v->block_size, physical = 0;
         if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
         u32 run, within = off % v->block_size;
-        if (!ext_block(v, f, logical, &physical, &run, &budget)) return false;
+        if (!ext_block(v, f, logical, &physical, &run, &budget, cursor)) return false;
         u32 n = min32(size, min32(run, UINT32_MAX / v->block_size) * v->block_size - within);
         if (!ext_data(v, physical, within, out, n)) return false;
         out += n; off += n; size -= n;
@@ -165,20 +195,22 @@ bool ext_lookup(struct volume *v, const struct node *dir, const char *name, stru
     /* Filesystem reads are serialized. Keep the largest supported block off
        the BIOS stack; mapping state and budget are fresh for each lookup. */
     static u8 block[65536];
-    u32 budget = 65536, run = 0;
+    /* Charge directory data in sectors as well as mappings and records. */
+    struct ext_budget budget = {65536, "ext directory lookup budget exceeded"};
+    u32 run = 0;
     u64 physical = 0;
     for (u64 off = 0; off + 8 <= dir->size;) {
-        if (!ext_work(&budget, v->block_size / 512)) return false;
+        if (!charge_work(&budget, v->block_size / 512)) return false;
         if (!run) {
             u64 logical = off / v->block_size;
             if (logical > UINT32_MAX) return error("ext logical offset exceeds 32 bits");
-            if (!ext_block(v, dir, logical, &physical, &run, &budget)) return false;
+            if (!ext_block(v, dir, logical, &physical, &run, &budget, NULL)) return false;
         }
         u32 n = min32(v->block_size, dir->size - off);
         if (!ext_data(v, physical, 0, block, n)) return false;
         u32 within = 0;
         for (; within + 8 <= n;) {
-            if (!ext_work(&budget, 1)) return false;
+            if (!charge_work(&budget, 1)) return false;
             const u8 *h = block + within;
             u32 ino = rd32(h), len = rd16(h + 4), name_len = h[6];
             if (v->block_size == 65536 && (len == 65535 || !len)) len = 65536;
