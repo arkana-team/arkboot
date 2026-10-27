@@ -37,7 +37,7 @@ static void entry(u8 *p, const char *name, u32 cluster, bool directory) {
     wr16(p + 26, cluster); wr16(p + 20, cluster >> 16);
 }
 static void make_image(struct volume *v, u32 bits, u32 sector, u32 spc, u32 length) {
-    u32 clusters = bits == 12 ? 1024 : bits == 16 ? 8192 : 65525;
+    u32 clusters = bits == 12 ? 1024 : bits == 16 ? 8192 : 131072;
     u32 fat_sectors = (((clusters + 2) * bits + 7) / 8 + sector - 1) / sector;
     u32 roots = bits == 32 ? 0 : 17;
     u32 root_sectors = (roots * 32 + sector - 1) / sector;
@@ -113,7 +113,7 @@ static void lookup_checks(u32 bits, u32 sector, u32 spc, u32 length) {
     cluster_data(&v, 2)[0] = 0xe5;
     set_link(&v, last, 2);
     /* Remount after mutation to invalidate the read-only driver's FAT cache. */
-    reads = 0; read_limit = 2 * (u64)v.u.fat.clusters + 8;
+    reads = 0; read_limit = 4 * (u64)length + 8;
     assert(fat_mount(&v) == (bits != 32));
     /* Direct lookup bounds total work even for an oversized cyclic node. */
     dir.size = ((u64)v.u.fat.clusters + 1) * v.u.fat.cluster_size;
@@ -121,7 +121,7 @@ static void lookup_checks(u32 bits, u32 sector, u32 spc, u32 length) {
     assert(!fat_lookup(&v, &dir, "missing", &out));
     assert(strstr(fs_error, "cyclic"));
     /* Mount/subdirectory sizing must still reject cycles and invalid links. */
-    reads = 0; read_limit = 2 * (u64)v.u.fat.clusters + 8;
+    reads = 0; read_limit = 4 * (u64)length + 8;
     assert(!(bits == 32 ? fat_mount(&v) : fs_open(&v, "/boot", &out)));
     assert(strstr(fs_error, "cyclic"));
     set_link(&v, 2, 1);
@@ -131,11 +131,63 @@ static void lookup_checks(u32 bits, u32 sector, u32 spc, u32 length) {
     assert(strstr(fs_error, "bad FAT cluster chain"));
     free(image);
 }
+static void cycle_checks(u32 bits, u32 prefix, u32 cycle) {
+    struct volume v;
+    u32 length = prefix + cycle;
+    make_image(&v, bits, 512, 1, length);
+    set_link(&v, chain_cluster(length - 1, v.u.fat.clusters),
+             chain_cluster(prefix, v.u.fat.clusters));
+    reads = 0; read_limit = 4 * (u64)length + 8;
+    assert(fat_mount(&v) == (bits != 32));
+    struct node out;
+    if (bits != 32) assert(!fs_open(&v, "/boot", &out));
+    assert(!strcmp(fs_error, "cyclic FAT directory chain"));
+    if (bits == 32) {
+        /* A separate one-cluster root reaches the same cycle as a child. */
+        u32 root = v.u.fat.clusters + 1;
+        set_link(&v, root, UINT32_MAX);
+        wr32(image + 44, root);
+        entry(cluster_data(&v, root), "BOOT       ", 2, true);
+        reads = 0;
+        assert(fat_mount(&v));
+        assert(!fs_open(&v, "/boot", &out));
+        assert(!strcmp(fs_error, "cyclic FAT directory chain"));
+    }
+    free(image);
+}
+static void sizing_limit_checks(void) {
+    for (u32 length = 65536; length <= 65537; length++) {
+        struct volume v;
+        /* Mount a short root first, then build a fragmented subdirectory. */
+        make_image(&v, 32, 512, 1, 1);
+        entry(cluster_data(&v, 2), "BOOT       ", chain_cluster(1, v.u.fat.clusters), true);
+        for (u32 i = 1; i <= length; i++)
+            set_link(&v, chain_cluster(i, v.u.fat.clusters),
+                     i < length ? chain_cluster(i + 1, v.u.fat.clusters) : UINT32_MAX);
+        reads = 0; read_limit = 65536 + 3;
+        assert(fat_mount(&v));
+        struct node out;
+        assert(fs_open(&v, "/boot", &out) == (length == 65536));
+        if (length == 65536) assert(out.size == (u64)length * 512);
+        else assert(!strcmp(fs_error, "FAT directory chain work limit exceeded"));
+        /* Exercise the same boundary through FAT32 root sizing. */
+        wr32(image + 44, chain_cluster(1, v.u.fat.clusters));
+        reads = 0; read_limit = 65536 + 1;
+        assert(fat_mount(&v) == (length == 65536));
+        if (length == 65536) assert(v.root.size == (u64)length * 512);
+        else assert(!strcmp(fs_error, "FAT directory chain work limit exceeded"));
+        free(image);
+    }
+}
 int main(void) {
     for (u32 bits = 12; bits <= 32; bits = bits == 12 ? 16 : bits == 16 ? 32 : 33) {
+        cycle_checks(bits, 0, 1);
+        cycle_checks(bits, 0, 2);
+        cycle_checks(bits, 31, 3);
         lookup_checks(bits, 512, 1, 128);
         lookup_checks(bits, 512, 2, 256);
     }
     lookup_checks(12, 4096, 2, 128);
+    sizing_limit_checks();
     puts("PASS FAT directory lookup: bounded I/O, fragmented chains, fixed roots, LFN and corrupt metadata");
 }
