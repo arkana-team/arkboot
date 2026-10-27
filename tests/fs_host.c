@@ -77,8 +77,9 @@ int main(int argc, char **argv) {
         /* Unaligned chunks cross sectors, clusters, ext indirect boundaries and
            UDF extents, while keeping test buffers below 1 MiB. */
         for (u64 off = 0; off < n.size;) {
-            u32 size = min32(65521, n.size - off);
-            if (fread(expected, 1, size, ref) != size || !fs_read(&v, &n, off, actual, size) ||
+            /* Bound the 64-bit remainder before narrowing it. */
+            u32 size = n.size - off > 65521 ? 65521 : (u32)(n.size - off);
+            if (!size || fread(expected, 1, size, ref) != size || !fs_read(&v, &n, off, actual, size) ||
                 memcmp(actual, expected, size)) die("file contents");
             off += size;
         }
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
         for (u32 j = 0; j < 32 && n.size; j++) {
             seed = seed * 1664525 + 1013904223;
             u64 off = seed % n.size;
-            u32 size = min32(4093, n.size - off);
+            u32 size = n.size - off > 4093 ? 4093 : (u32)(n.size - off);
             if (fseeko(ref, off, SEEK_SET) || fread(expected, 1, size, ref) != size ||
                 !fs_read(&v, &n, off, actual, size) || memcmp(actual, expected, size)) die("random file contents");
         }
