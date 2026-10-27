@@ -152,8 +152,10 @@ writing to reject mounted devices, including mounts outside the current
 namespace. Keep automounters and other disk tools stopped during installation.
 
 For both disk writing and CD burning, the helper copies the image into a
-root-private directory under `/tmp` after confirmation, validates that snapshot,
-and uses it for writing and comparison. Allow free space for a full image copy.
+root-private directory under `/tmp` and validates that snapshot before displaying
+the write plan and asking for confirmation. It uses that same snapshot for
+writing and comparison, so later changes to the source cannot change the bytes
+written. Allow free space for a full image copy.
 The temporary copy is removed on completion or failure.
 The image must be a regular file with no symlinks in its path. Its source is
 kept open from initial validation through snapshot creation.

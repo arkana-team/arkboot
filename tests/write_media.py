@@ -62,6 +62,26 @@ class MediaWriterTests(unittest.TestCase):
     def validate(self, tree=None, kind="disk", size=2048, swaps=None):
         writer.validate_target(tree or self.tree, kind, size, swaps or set(), self.sysfs)
 
+    @contextlib.contextmanager
+    def snapshot_writes(self, after_write):
+        open_file = pathlib.Path.open
+
+        def open_target(path, mode="r", *args, **kwargs):
+            target = open_file(path, mode, *args, **kwargs)
+            if mode == "xb":
+                original_write = target.write
+
+                def write(data):
+                    count = original_write(data)
+                    after_write(target)
+                    return count
+
+                target.write = write
+            return target
+
+        with mock.patch.object(pathlib.Path, "open", autospec=True, side_effect=open_target):
+            yield
+
     def test_accept_unused_whole_disk(self):
         self.validate()
 
@@ -165,11 +185,14 @@ class MediaWriterTests(unittest.TestCase):
         if mock_blank_cd:
             stack.enter_context(mock.patch.object(writer, "blank_cd"))
         self.run = stack.enter_context(mock.patch.object(writer, "run", side_effect=failure))
-        with stack, contextlib.redirect_stdout(io.StringIO()):
+        self.output = io.StringIO()
+        with stack, contextlib.redirect_stdout(self.output):
             writer.main()
 
     def test_default_is_preview_without_prompt_or_write(self):
-        self.invoke()
+        with mock.patch.object(writer, "image_snapshot") as snapshot:
+            self.invoke()
+        snapshot.assert_not_called()
         self.input.assert_not_called()
         self.open.assert_not_called()
         self.run.assert_not_called()
@@ -197,16 +220,67 @@ class MediaWriterTests(unittest.TestCase):
             self.invoke(["--write"], response=str(self.device), fresh=fresh)
         self.run.assert_not_called()
 
-    def test_changed_source_image_is_refused(self):
-        def change_image(prompt):
-            data = self.disk_image()
-            data[200] = 1
-            self.image.write_bytes(data)
-            return str(self.device)
-        with self.assertRaisesRegex(ValueError, "Image changed"):
-            self.invoke(["--write"], response=change_image)
-        self.run.assert_not_called()
+    def test_confirmation_source_overwrites_cannot_change_planned_bytes(self):
+        for kind in ("disk", "cd"):
+            for restore_mtime in (False, True):
+                with self.subTest(kind=kind, restore_mtime=restore_mtime):
+                    original = bytes(self.disk_image() if kind == "disk" else self.iso_image())
+                    self.image.write_bytes(original)
+                    before = self.image.stat()
+                    self.tree.update(type="disk" if kind == "disk" else "rom", size=len(original) * 2)
+                    snapshots = []
+
+                    def confirm(prompt):
+                        snapshot = pathlib.Path(inspect_image.call_args.args[0].name)
+                        self.assertNotEqual(snapshot, self.image)
+                        self.assertEqual(snapshot.read_bytes(), original)
+                        self.assertIn(str(snapshot), self.output.getvalue())
+                        changed = bytearray(original)
+                        changed[1500] = 42  # Preserve size, format checks and GPT flag.
+                        self.image.write_bytes(changed)
+                        if restore_mtime:
+                            os.utime(self.image, ns=(before.st_atime_ns, before.st_mtime_ns))
+                            after = self.image.stat()
+                            for attr in ("st_dev", "st_ino", "st_size", "st_mtime_ns"):
+                                self.assertEqual(getattr(before, attr), getattr(after, attr))
+                        return str(self.device)
+
+                    def execute(command):
+                        if command[0] == "dd":
+                            source = pathlib.Path(command[1][3:])
+                        elif command[0] in ("cmp", "xorriso"):
+                            source = pathlib.Path(command[-2] if command[0] == "cmp" else command[-1])
+                        else:
+                            return
+                        self.assertEqual(source, pathlib.Path(inspect_image.call_args.args[0].name))
+                        self.assertEqual(source.read_bytes(), original)
+                        snapshots.append(source)
+
+                    with mock.patch.object(writer, "image_info", wraps=writer.image_info) as inspect_image:
+                        self.invoke(["--write"], response=confirm, failure=execute, kind=kind,
+                                    mock_blank_cd=kind == "cd")
+                    self.assertEqual(len(snapshots), 2 if kind == "disk" else 1)
+                    self.assertTrue(all(not path.parent.exists() for path in snapshots))
+
+    def test_invalid_snapshot_is_rejected_before_plan_and_confirmation(self):
+        snapshots = []
+
+        def corrupt(target):
+            snapshots.append(pathlib.Path(target.name))
+            target.flush()
+            os.ftruncate(target.fileno(), 0)
+            os.lseek(target.fileno(), 0, os.SEEK_SET)
+            os.write(target.fileno(), b"not an image")
+
+        with self.snapshot_writes(corrupt):
+            with self.assertRaisesRegex(ValueError, "Expected a complete Arkboot"):
+                self.invoke(["--write"], response=str(self.device))
+        self.assertEqual(self.output.getvalue(), "")
+        self.input.assert_not_called()
         self.open.assert_not_called()
+        self.run.assert_not_called()
+        self.assertEqual(len(snapshots), 1)
+        self.assertFalse(snapshots[0].parent.exists())
 
     def test_ancestor_replacement_cannot_redirect_source(self):
         for kind in ("disk", "cd"):
@@ -358,43 +432,107 @@ class MediaWriterTests(unittest.TestCase):
                     self.image.unlink()
                 self.image.write_bytes(self.disk_image())
 
-    def test_snapshot_keeps_open_source_when_path_is_replaced_during_copy(self):
-        copy_source = writer.shutil.copyfileobj
+    def test_snapshot_rejects_source_path_replacement_during_copy(self):
+        snapshots = []
 
-        def replace(source, target, length):
+        def replace(target):
+            snapshots.append(pathlib.Path(target.name))
             self.image.unlink()
             self.image.symlink_to(self.device)
-            copy_source(source, target, length)
 
-        with writer.open_image(self.image) as source, mock.patch.object(
-                writer.shutil, "copyfileobj", side_effect=replace):
+        with writer.open_image(self.image) as source, self.snapshot_writes(replace):
             expected = writer.file_identity(source.fileno())
-            with writer.image_snapshot(source, expected) as snapshot:
-                self.assertEqual(snapshot.read_bytes(), self.disk_image())
-                self.assertEqual(snapshot.parent.parent, pathlib.Path("/tmp"))
-        self.assertFalse(snapshot.parent.exists())
+            with self.assertRaisesRegex(ValueError, "Image changed while copying"):
+                with writer.image_snapshot(source, expected):
+                    self.fail("Path replacement during copying was accepted")
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].parent.parent, pathlib.Path("/tmp"))
+        self.assertFalse(snapshots[0].parent.exists())
+
+    def test_snapshot_rejects_equal_length_overwrite_with_restored_mtime(self):
+        before = self.image.stat()
+        snapshots = []
+
+        def change(target):
+            snapshots.append(pathlib.Path(target.name))
+            changed = self.disk_image()
+            changed[1500] = 42
+            self.image.write_bytes(changed)
+            os.utime(self.image, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = self.image.stat()
+            for attr in ("st_dev", "st_ino", "st_size", "st_mtime_ns"):
+                self.assertEqual(getattr(before, attr), getattr(after, attr))
+
+        with writer.open_image(self.image) as source, self.snapshot_writes(change):
+            expected = writer.file_identity(source.fileno())
+            with self.assertRaisesRegex(ValueError, "Image changed while copying"):
+                with writer.image_snapshot(source, expected):
+                    self.fail("Source overwrite during copying was accepted")
+        self.assertEqual(len(snapshots), 1)
+        self.assertFalse(snapshots[0].parent.exists())
 
     def test_snapshot_refuses_in_place_changes_and_cleans_up_copy_failure(self):
-        copy_source = writer.shutil.copyfileobj
         for fail_copy in (False, True):
             with self.subTest(fail_copy=fail_copy):
                 snapshots = []
 
-                def change(source, target, length):
+                def change(target):
                     snapshots.append(pathlib.Path(target.name))
-                    copy_source(source, target, length)
                     if fail_copy:
                         raise OSError("Copy failed")
-                    self.image.write_bytes(b"changed")
+                    self.image.write_bytes(b"x" * expected[2])
+                    os.utime(self.image, ns=(expected[3], expected[3] + 1))
 
-                with writer.open_image(self.image) as source, mock.patch.object(
-                        writer.shutil, "copyfileobj", side_effect=change):
+                with writer.open_image(self.image) as source, self.snapshot_writes(change):
                     expected = writer.file_identity(source.fileno())
                     with self.assertRaisesRegex((ValueError, OSError), "changed|Copy failed"):
                         with writer.image_snapshot(source, expected):
                             self.fail("Failed copy was accepted")
                 self.assertEqual(len(snapshots), 1)
                 self.assertFalse(snapshots[0].parent.exists())
+
+    def test_snapshot_growth_is_bounded_before_any_device_write(self):
+        for kind, size in (("disk", 2048), ("cd", 20 * 2048),
+                           ("disk", 1024 * 1024), ("cd", 1024 * 1024 + 2048)):
+            with self.subTest(kind=kind, size=size):
+                data = self.disk_image() if kind == "disk" else self.iso_image()
+                self.image.write_bytes(data + b"\0" * (size - len(data)))
+                self.tree.update(type="disk" if kind == "disk" else "rom", size=size * 2)
+                snapshots, written = [], []
+
+                def grow(target):
+                    snapshots.append(pathlib.Path(target.name))
+                    written.append(target.tell())
+                    with self.image.open("r+b") as source:
+                        source.truncate(size + 2 * 1024 * 1024)
+
+                with self.snapshot_writes(grow):
+                    with self.assertRaisesRegex(ValueError, "Image changed"):
+                        self.invoke(["--write"], response=str(self.device), kind=kind,
+                                    mock_blank_cd=kind == "cd")
+                self.assertTrue(written)
+                self.assertLessEqual(max(written), size)
+                self.assertTrue(all(not path.parent.exists() for path in snapshots))
+                self.run.assert_not_called()
+                self.open.assert_not_called()
+                self.assertEqual(self.device.read_bytes(), b"untouched")
+
+    def test_snapshot_rejects_premature_eof(self):
+        self.image.write_bytes(self.disk_image() + b"\0" * (1024 * 1024))
+        snapshots = []
+
+        def shrink(target):
+            snapshots.append(pathlib.Path(target.name))
+            with self.image.open("r+b") as source:
+                source.truncate(1024 * 1024)
+
+        with writer.open_image(self.image) as source, self.snapshot_writes(shrink):
+            expected = writer.file_identity(source.fileno())
+            with self.assertRaisesRegex(ValueError, "Image changed"):
+                with writer.image_snapshot(source, expected):
+                    self.fail("Truncated source was accepted")
+        self.assertTrue(snapshots)
+        self.assertTrue(all(not path.parent.exists() for path in snapshots))
 
     def test_cd_command(self):
         command = writer.commands("cd", self.image, pathlib.Path("/dev/sr0"), 4096, False, 8)[0]
