@@ -20,54 +20,72 @@ def run(command, **kwargs):
     return subprocess.run(command, check=True, env={**os.environ, "LC_ALL": "C"}, **kwargs)
 
 
-def file_identity(path):
-    info = os.stat(path)
+def file_identity(fd):
+    info = os.fstat(fd)
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 @contextlib.contextmanager
-def image_snapshot(image, expected_identity):
-    # Pin the source before copying; refuse substitutions and special files.
-    fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+def open_image(image):
+    # Pin each ancestor without following symlinks, as in mkimage.copy_root.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(image.anchor, directory_flags)
+    try:
+        for name in image.parts[1:-1]:
+            descriptor = os.open(name, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = descriptor
+        fd = os.open(image.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory)
+    finally:
+        os.close(directory)
     with os.fdopen(fd, "rb") as source:
-        if (not stat.S_ISREG(os.fstat(fd).st_mode)
-                or file_identity(fd) != expected_identity):
-            raise ValueError("Image changed during confirmation")
-        # Ignore TMPDIR: the snapshot's parent must not be attacker-controlled.
-        # /tmp's sticky bit protects our private directory from replacement.
-        with tempfile.TemporaryDirectory(prefix="arkboot-media-", dir="/tmp") as directory:
-            snapshot = pathlib.Path(directory) / "image"
-            with snapshot.open("xb") as target:
-                shutil.copyfileobj(source, target, 1024 * 1024)
-            if file_identity(fd) != expected_identity:
-                raise ValueError("Image changed while copying")
-            yield snapshot
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("Image must be a nonempty regular file")
+        yield source
 
 
-def image_info(image, kind):
-    info = image.stat()
+@contextlib.contextmanager
+def image_snapshot(source, expected_identity):
+    fd = source.fileno()
+    if file_identity(fd) != expected_identity:
+        raise ValueError("Image changed during confirmation")
+    source.seek(0)
+    # Ignore TMPDIR: the snapshot's parent must not be attacker-controlled.
+    # /tmp's sticky bit protects our private directory from replacement.
+    with tempfile.TemporaryDirectory(prefix="arkboot-media-", dir="/tmp") as directory:
+        snapshot = pathlib.Path(directory) / "image"
+        with snapshot.open("xb") as target:
+            shutil.copyfileobj(source, target, 1024 * 1024)
+        if file_identity(fd) != expected_identity:
+            raise ValueError("Image changed while copying")
+        yield snapshot
+
+
+def image_info(stream, kind):
+    info = os.fstat(stream.fileno())
     if not stat.S_ISREG(info.st_mode) or not info.st_size:
         raise ValueError("Image must be a nonempty regular file")
-    with image.open("rb") as stream:
-        if kind == "disk":
-            header = stream.read(1024)
-            if (info.st_size % 512 or len(header) < 1024 or header[510:512] != b"\x55\xaa"
-                    or b"ARKBOOT: BIOS disk read failed" not in header[:440]):
-                raise ValueError("Expected a complete Arkboot .img from scripts/mkimage.py disk")
-            protective = any(header[446 + i * 16 + 4] == 0xee for i in range(4))
-            gpt = header[512:520] == b"EFI PART"
-            if protective != gpt:
-                raise ValueError("Inconsistent protective MBR/GPT in image")
-            return info.st_size, gpt
-        if info.st_size % 2048:
-            raise ValueError("ISO size must be a multiple of 2048 bytes")
-        for block in range(16, 80):
-            stream.seek(block * 2048)
-            descriptor = stream.read(2048)
-            if len(descriptor) != 2048 or descriptor[1:6] != b"CD001" or descriptor[0] == 255:
-                break
-            if descriptor[0] == 0 and descriptor[7:30] == b"EL TORITO SPECIFICATION":
-                return info.st_size, False
+    stream.seek(0)
+    if kind == "disk":
+        header = stream.read(1024)
+        if (info.st_size % 512 or len(header) < 1024 or header[510:512] != b"\x55\xaa"
+                or b"ARKBOOT: BIOS disk read failed" not in header[:440]):
+            raise ValueError("Expected a complete Arkboot .img from scripts/mkimage.py disk")
+        protective = any(header[446 + i * 16 + 4] == 0xee for i in range(4))
+        gpt = header[512:520] == b"EFI PART"
+        if protective != gpt:
+            raise ValueError("Inconsistent protective MBR/GPT in image")
+        return info.st_size, gpt
+    if info.st_size % 2048:
+        raise ValueError("ISO size must be a multiple of 2048 bytes")
+    for block in range(16, 80):
+        stream.seek(block * 2048)
+        descriptor = stream.read(2048)
+        if len(descriptor) != 2048 or descriptor[1:6] != b"CD001" or descriptor[0] == 255:
+            break
+        if descriptor[0] == 0 and descriptor[7:30] == b"EL TORITO SPECIFICATION":
+            return info.st_size, False
     raise ValueError("Expected a bootable El Torito ISO from scripts/mkimage.py iso")
 
 
@@ -171,9 +189,16 @@ def main():
         raise ValueError("This helper supports Linux; see docs/install.md for other systems")
     if args.speed is not None and (args.kind != "cd" or args.speed < 1):
         parser.error("--speed must be a positive integer and is only for CD burning")
-    image, device = args.image.resolve(strict=True), args.device.resolve(strict=True)
-    source_identity = file_identity(image)
-    size, gpt = image_info(image, args.kind)
+    # Preserve symlinks for the descriptor walk to reject, rather than resolve.
+    image = pathlib.Path(os.path.abspath(args.image))
+    device = args.device.resolve(strict=True)
+    with open_image(image) as source:
+        write_media(args, image, source, device)
+
+
+def write_media(args, image, source, device):
+    source_identity = file_identity(source.fileno())
+    size, gpt = image_info(source, args.kind)
     tree = device_tree(device)
     number = device.stat().st_rdev
     validate_target(tree, args.kind, size, active_swaps())
@@ -200,9 +225,10 @@ def main():
         raise ValueError("Confirmation did not match; nothing was written")
     # Recheck after confirmation; keep a disk exclusive-open during the write so
     # the kernel refuses mounted devices (including mounts in other namespaces).
-    with image_snapshot(image, source_identity) as snapshot:
-        if image_info(snapshot, args.kind) != (size, gpt):
-            raise ValueError("Image changed during confirmation")
+    with image_snapshot(source, source_identity) as snapshot:
+        with snapshot.open("rb") as snapshot_source:
+            if image_info(snapshot_source, args.kind) != (size, gpt):
+                raise ValueError("Image changed during confirmation")
         plan = commands(args.kind, snapshot, device, size, gpt, args.speed)
         current = device_tree(device)
         if identity(current) != identity(tree) or device.stat().st_rdev != number:
