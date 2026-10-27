@@ -208,6 +208,10 @@ Each ext directory lookup has a 65536-unit work budget, counting directory
 records, extent headers/entries, indirect pointers and 512-byte directory data
 sectors. Exceeding it stops lookup with an error, including on otherwise valid
 directories that require too much work for boot-time discovery.
+Each ext file read request also has a cumulative 65536-unit metadata budget,
+counting extent headers/entries and indirect pointers across all mappings. Reads
+that exceed it fail with an error, including valid fragmented or sparse files
+whose metadata traversal requires excessive work. File data is not charged.
 
 On disk, MBR primary/logical partitions and GPT are supported. GPT header and
 entry-array CRCs are checked. For BIOS, extended disk services (EDD) and E820 are

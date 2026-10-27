@@ -6,6 +6,7 @@
 /* Small synthetic images can alias one directory block across many extents.
    Count actual disk reads so an I/O amplification regression fails promptly. */
 static u8 image[32 * 65536];
+static u8 file_data[33 * 1024 * 1024];
 static u32 reads, metadata_reads, data_reads, read_limit;
 static struct volume volume;
 static struct node directory;
@@ -52,14 +53,76 @@ static void missing(void) {
 static void budget_exceeded(void) {
     struct node out;
     assert(!ext_lookup(&volume, &directory, "missing", &out));
-    assert(fs_error && !strcmp(fs_error, "ext directory lookup budget exceeded"));
+    assert(fs_error && !strcmp(fs_error, "ext work budget exceeded"));
 }
 static void invalid_record(void) {
     struct node out;
     assert(!ext_lookup(&volume, &directory, "missing", &out));
     assert(fs_error && !strcmp(fs_error, "invalid ext directory record"));
 }
+static void read_budget_exceeded(void) {
+    directory.directory = false;
+    directory.size = sizeof file_data;
+    read_limit = 131072;
+    assert(!fs_read(&volume, &directory, 0, file_data, sizeof file_data));
+    assert(fs_error && !strcmp(fs_error, "ext work budget exceeded"));
+    assert(reads < 131072);
+    /* Exhaustion must not leak into a subsequent independent request. */
+    assert(fs_read(&volume, &directory, 12 * volume.block_size, file_data, 1));
+}
 int main(void) {
+    /* Regular-file reads must share a budget across mappings. Small extent
+       trees can otherwise cause millions of reads, including across holes. */
+    for (u32 bs = 1024; bs <= 65536; bs *= 2) {
+        fixture(bs, (bs - 12) / 12, 1);
+        read_budget_exceeded();
+    }
+    fixture(1024, 1, 1);
+    extent(image + 2 * 1024 + 12, sizeof file_data / 1024, 1, 3);
+    read_budget_exceeded();
+    fixture(1024, 1, 1);
+    header(directory.meta + 40, 1, 4, 0);
+    extent(directory.meta + 52, sizeof file_data / 1024, 1, 3);
+    read_budget_exceeded();
+
+    /* Legacy indirect pointers are subject to the same cumulative limit. */
+    fixture(1024, 1, 1);
+    memset(directory.meta + 32, 0, 68);
+    wr32(directory.meta + 88, 2);
+    wr32(directory.meta + 92, 2);
+    for (u32 i = 0; i < 1024 / 4; i++) wr32(image + 2 * 1024 + i * 4, 2);
+    read_budget_exceeded();
+
+    /* A large unwritten extent costs metadata work, not its byte length. */
+    fixture(2048, 1, 1);
+    directory.directory = false;
+    directory.size = sizeof file_data;
+    extent(image + 2 * 2048 + 12, 0, 32768 + sizeof file_data / 2048, 0);
+    memset(file_data, 0xff, sizeof file_data);
+    assert(fs_read(&volume, &directory, 0, file_data, sizeof file_data));
+    assert(metadata_reads == 2 && data_reads == 0);
+    for (u32 i = 0; i < sizeof file_data; i++) assert(file_data[i] == 0);
+
+    /* Fresh requests retain normal unaligned reads, sparse zero filling and
+       error propagation for invalid extent metadata. */
+    for (u32 bs = 1024; bs <= 65536; bs *= 2) {
+        fixture(bs, 1, 1);
+        directory.directory = false;
+        directory.size = 3 * bs;
+        extent(image + 2 * bs + 12, 1, 1, 3);
+        memset(file_data, 0xff, 3 * bs);
+        assert(fs_read(&volume, &directory, 1, file_data, 3 * bs - 2));
+        for (u32 i = 0; i < 3 * bs - 2; i++) {
+            u32 pos = i + 1;
+            assert(file_data[i] == (pos >= bs && pos < 2 * bs ? image[3 * bs + pos - bs] : 0));
+        }
+        assert(fs_read(&volume, &directory, bs + 7, file_data, 17));
+        assert(!memcmp(file_data, image + 3 * bs + 7, 17));
+        wr16(image + 2 * bs, 0);
+        assert(!fs_read(&volume, &directory, 0, file_data, 1));
+        assert(fs_error && !strcmp(fs_error, "invalid ext extent tree"));
+    }
+
     /* 84 ordered extents alias the same physical block. Previously this
        incurred over 600,000 reads for a directory stored in two blocks. */
     fixture(1024, 84, 1);
@@ -145,6 +208,6 @@ int main(void) {
     invalid_record();
     directory.size = 1024;
     missing();
-    puts("ext directory lookup checks passed");
+    puts("ext directory lookup and file read checks passed");
     return 0;
 }
