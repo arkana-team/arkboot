@@ -287,6 +287,8 @@ These BIOS logs are retained under `build/boot-tests-dual/`.
 
 See [docs/design.md](docs/design.md) for implementation references and layout,
 and [docs/validation.md](docs/validation.md) for the executed validation matrix.
+Host-side checks also run in CI (see `.github/workflows/ci.yml`); development
+workflow and coding conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

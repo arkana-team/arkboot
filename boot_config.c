@@ -24,7 +24,7 @@ bool config_load(struct volume *v, struct boot_entry *selected) {
     config_text[cfg.size] = 0;
     u32 line;
     const char *err = config_parse(&boot_config, config_text, path < 4, &line);
-    if (err) { print("Configuration error near line "); print_hex(line); print("\n"); panic(err); }
+    if (err) { print("Configuration error near line "); print_u32(line); print("\n"); panic(err); }
     *selected = boot_config.entries[menu_select(&boot_config)];
     return true;
 }
