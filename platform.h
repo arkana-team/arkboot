@@ -21,6 +21,7 @@ int console_key(void);
 u32 console_millis(void);
 void print(const char *s);
 void print_hex(u32 n);
+void print_u32(u32 n);
 _Noreturn void panic(const char *s);
 
 static inline u16 rd16(const void *p) {
