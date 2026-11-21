@@ -1,11 +1,5 @@
 #include "config.h"
 
-static void decimal(u32 n) {
-    char digits[11];
-    u32 length = 0;
-    do { digits[length++] = '0' + n % 10; n /= 10; } while (n);
-    while (length) { char s[2] = {digits[--length], 0}; print(s); }
-}
 static void draw(const struct boot_config *c, u32 selected, int remaining) {
     console_clear();
     print("ARKBOOT - Boot menu\n\n");
@@ -15,9 +9,13 @@ static void draw(const struct boot_config *c, u32 selected, int remaining) {
     }
     print("\nUp/Down or W/S: select    Enter: boot\n");
     if (remaining >= 0) {
-        print("Booting selected entry in "); decimal(remaining);
+        print("Booting selected entry in "); print_u32((u32)remaining);
         print(" seconds. Any key stops the timer.\n");
-    } else print("Automatic boot stopped. Select an entry and press Enter.\n");
+    } else if (c->timeout < 0) {
+        print("Automatic boot disabled. Select an entry and press Enter.\n");
+    } else {
+        print("Automatic boot stopped. Select an entry and press Enter.\n");
+    }
 }
 u32 menu_select(const struct boot_config *c) {
     u32 selected = c->default_entry;

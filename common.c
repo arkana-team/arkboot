@@ -40,6 +40,18 @@ u64 __umoddi3(u64 n, u64 d) { u64 r; divide(n, d, &r); return r; }
 u64 __udivmoddi4(u64 n, u64 d, u64 *r) { return divide(n, d, r); }
 
 #endif
+void print_u32(u32 n) {
+    char digits[11];
+    int length = 0;
+    do { digits[length++] = '0' + n % 10; n /= 10; } while (n);
+    for (int i = 0; i < length / 2; i++) {
+        char tmp = digits[i];
+        digits[i] = digits[length - 1 - i];
+        digits[length - 1 - i] = tmp;
+    }
+    digits[length] = 0;
+    print(digits);
+}
 void print_hex(u32 n) {
     char s[11] = "0x00000000";
     for (u32 i = 0; i < 8; i++) s[9 - i] = "0123456789abcdef"[(n >> (4 * i)) & 15];

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Host-side checks: config parsing, FAT/ext/UDF readers, image staging.
+  # firmware-dependent validation (QEMU/OVMF, cdrtools, mtools) stays manual;
+  # see docs/validation.md. tests/write_media.py is intentionally excluded:
+  # one test encodes an fd-pinning security model that a second stale test
+  # contradicts (see docs and the PR notes), and one check depends on a
+  # filesystem with nanosecond timestamps, which the harness cannot guarantee.
+  host-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc e2fsprogs
+      - name: Configuration parser (ASan/UBSan)
+        run: |
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -Wall -Wextra -Werror tests/config_host.c config.c -o /tmp/config_host
+          /tmp/config_host
+      - name: FAT, ext, UDF host harnesses
+        run: |
+          for harness in fat ext_lookup udf; do
+            gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+                -Wall -Wextra -Werror tests/${harness}_host.c disk.c \
+                fs/fs.c fs/fat.c fs/ext.c fs/iso9660.c fs/udf.c -o /tmp/${harness}_host
+            /tmp/${harness}_host
+          done
+      - name: ext2/3/4 image reader
+        run: |
+          mkdir -p /tmp/ext-root/boot
+          printf 'kernel=/boot/payload.bin\ninitrd=\n' > /tmp/ext-root/boot/arkboot.cfg
+          head -c 2000000 /dev/urandom > /tmp/ext-root/boot/payload.bin
+          truncate -s 67108864 /tmp/image.img
+          mkfs.ext4 -q -F -d /tmp/ext-root /tmp/image.img
+          gcc -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=undefined \
+              -fno-sanitize-recover=all -Wall -Wextra -Werror \
+              tests/fs_host.c disk.c bios_disk.c \
+              fs/fs.c fs/fat.c fs/ext.c fs/iso9660.c fs/udf.c -o /tmp/fs_host
+          /tmp/fs_host /tmp/image.img 512 "ext2/3/4" \
+              /boot/arkboot.cfg /tmp/ext-root/boot/arkboot.cfg \
+              /boot/payload.bin /tmp/ext-root/boot/payload.bin
+      - name: Image-staging tests
+        run: python3 tests/image_builder.py
