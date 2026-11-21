@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "platform.h"
+#include "../platform.h"
 
 /* Host harness for common.c's number formatting: print_hex and print_u32. */
 static char output[256];
