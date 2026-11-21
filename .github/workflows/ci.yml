@@ -23,6 +23,11 @@ jobs:
           gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
               -Wall -Wextra -Werror tests/config_host.c config.c -o /tmp/config_host
           /tmp/config_host
+      - name: Console formatting harness
+        run: |
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -Wall -Wextra -Werror tests/console_host.c common.c -o /tmp/console_host
+          /tmp/console_host
       - name: FAT, ext, UDF host harnesses
         run: |
           for harness in fat ext_lookup udf; do
